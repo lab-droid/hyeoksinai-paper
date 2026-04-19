@@ -123,6 +123,7 @@ const FileUploadSection = ({ title, icon: Icon, colorClass, files, setFiles, req
 export default function App() {
   const [apiKey, setApiKey] = useState('');
   const [isKeyModalOpen, setIsKeyModalOpen] = useState(false);
+  const [isPatchNotesOpen, setIsPatchNotesOpen] = useState(false);
   const [tempKey, setTempKey] = useState('');
 
   const [announcementFiles, setAnnouncementFiles] = useState<File[]>([]);
@@ -138,6 +139,57 @@ export default function App() {
   const [error, setError] = useState('');
   const [isCopied, setIsCopied] = useState(false);
   const [selectedModel, setSelectedModel] = useState<'gemini-3.1-pro-preview' | 'gemini-3-flash-preview'>('gemini-3.1-pro-preview');
+
+  const patchNotes = [
+    {
+      date: '2026-04-19',
+      title: '패치노트 및 API 비용 안내 추가',
+      details: [
+        '상단 헤더에 패치노트 확인 기능 추가',
+        '예상 API 사용 비용(KRW) 안내 섹션 추가',
+        'UI 레이아웃 최적화'
+      ]
+    },
+    {
+      date: '2026-03-24',
+      title: '입력 방식 개편 및 운영 기준 추가',
+      details: [
+        '운영 기준 항목(파일 첨부) 추가',
+        '모든 입력 항목을 파일 첨부 중심으로 UI 전면 개편',
+        '전반적인 내용(필수) 항목의 편의성 개선',
+        '홈 이동 시 데이터 초기화 로직 보강'
+      ]
+    },
+    {
+      date: '2026-03-22',
+      title: '모델 선택 및 사용 가이드 추가',
+      details: [
+        'Gemini 1.5 Pro / Flash 모델 선택 기능 추가 (할당량 대응)',
+        '상단 네비게이션(홈, 사용방법) 추가 및 가이드 페이지 구현',
+        'API 할당량 초과(429) 및 오류 메시지 시각화 개선',
+        '헤더 로고 클릭 시 홈 이동 기능 추가'
+      ]
+    },
+    {
+      date: '2026-03-21',
+      title: '출력 포맷 및 시각화 강화',
+      details: [
+        '표(Table) 테두리 선 및 스타일 적용 (Typography 플러그인)',
+        '강조 텍스트 색상(빨강, 파랑, 초록) 및 Bold 자동 적용',
+        '이미지 삽입 가이드 Placeholder 생성 로직 추가',
+        '생성 진행률(%) 시각화 및 화면 전환 UX 적용'
+      ]
+    },
+    {
+      date: '2026-03-15',
+      title: '초기 런칭',
+      details: [
+        'Gemini AI 기반 고득점 사업계획서 생성 엔진 탑재',
+        'PDF, DOCX, HWP 파일 분석 기능',
+        'Word(.doc) 다운로드 및 클립보드 복사 기능'
+      ]
+    }
+  ];
 
   useEffect(() => {
     const storedKey = localStorage.getItem('gemini_api_key');
@@ -319,7 +371,7 @@ export default function App() {
             className="flex items-center gap-2 hover:opacity-80 transition-opacity text-left"
           >
             <FileText className="w-6 h-6 text-neutral-800" />
-            <h1 className="text-xl font-bold tracking-tight text-neutral-900 hidden sm:block">혁신 사업계획서 작성 AI</h1>
+            <h1 className="text-xl font-bold tracking-tight text-neutral-900 hidden lg:block">혁신 사업계획서 작성 AI</h1>
           </button>
           <nav className="flex items-center gap-6">
             <button
@@ -339,21 +391,40 @@ export default function App() {
             </button>
           </nav>
         </div>
-        <button
-          onClick={() => {
-            setTempKey(apiKey);
-            setIsKeyModalOpen(true);
-          }}
-          className="flex items-center gap-2 px-4 py-2 rounded-full bg-neutral-100 hover:bg-neutral-200 transition-colors text-sm font-medium"
-        >
-          <Key className="w-4 h-4" />
-          <span>API Key</span>
-          {apiKey ? (
-            <CheckCircle2 className="w-4 h-4 text-emerald-500" />
-          ) : (
-            <XCircle className="w-4 h-4 text-red-500" />
-          )}
-        </button>
+        
+        <div className="flex items-center gap-3">
+          {/* API Cost Info */}
+          <div className="hidden md:flex flex-col items-end mr-2 text-[10px] text-neutral-500">
+            <div className="flex items-center gap-1">
+              <span className="font-bold text-neutral-700">예상 API 비용:</span>
+              <span>약 0원 ~ 600원</span>
+            </div>
+            <p className="opacity-70 whitespace-nowrap">※ 결과물 길이에 따라 오차 발생 가능</p>
+          </div>
+
+          <button
+            onClick={() => setIsPatchNotesOpen(true)}
+            className="flex items-center gap-2 px-3 py-2 rounded-full bg-neutral-100 hover:bg-neutral-200 transition-colors text-xs font-semibold text-neutral-700"
+          >
+            패치노트
+          </button>
+
+          <button
+            onClick={() => {
+              setTempKey(apiKey);
+              setIsKeyModalOpen(true);
+            }}
+            className="flex items-center gap-2 px-3 py-2 rounded-full bg-neutral-100 hover:bg-neutral-200 transition-colors text-xs font-bold shrink-0"
+          >
+            <Key className="w-3.5 h-3.5" />
+            <span className="hidden sm:inline">API Key</span>
+            {apiKey ? (
+              <CheckCircle2 className="w-3.5 h-3.5 text-emerald-500" />
+            ) : (
+              <XCircle className="w-3.5 h-3.5 text-red-500" />
+            )}
+          </button>
+        </div>
       </header>
 
       <main className="max-w-5xl mx-auto px-6 py-8 space-y-8">
@@ -632,6 +703,52 @@ export default function App() {
           <p className="mt-1">© {new Date().getFullYear()} 혁신 사업계획서 작성 AI. All rights reserved.</p>
         </div>
       </footer>
+
+      {/* Patch Notes Modal */}
+      {isPatchNotesOpen && (
+        <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/50 backdrop-blur-sm p-4">
+          <motion.div
+            initial={{ opacity: 0, scale: 0.95 }}
+            animate={{ opacity: 1, scale: 1 }}
+            className="bg-white rounded-2xl shadow-2xl w-full max-w-lg overflow-hidden flex flex-col max-h-[80vh]"
+          >
+            <div className="p-6 border-b border-neutral-100 flex justify-between items-center">
+              <div>
+                <h3 className="text-xl font-bold text-neutral-900">패치노트</h3>
+                <p className="text-sm text-neutral-500 mt-0.5">업데이트 내역 및 히스토리</p>
+              </div>
+              <button 
+                onClick={() => setIsPatchNotesOpen(false)}
+                className="p-2 hover:bg-neutral-100 rounded-full transition-colors"
+              >
+                <X className="w-5 h-5 text-neutral-500" />
+              </button>
+            </div>
+            <div className="p-6 overflow-y-auto space-y-8">
+              {patchNotes.map((note, i) => (
+                <div key={i} className="relative pl-6 border-l-2 border-neutral-100 last:border-0 pb-2">
+                  <div className="absolute -left-[9px] top-0 w-4 h-4 rounded-full bg-white border-2 border-indigo-500" />
+                  <div className="flex items-center gap-3 mb-2">
+                    <span className="text-xs font-bold text-indigo-600 bg-indigo-50 px-2 py-0.5 rounded uppercase tracking-wider">{note.date}</span>
+                    <h4 className="text-sm font-bold text-neutral-900">{note.title}</h4>
+                  </div>
+                  <ul className="space-y-1.5">
+                    {note.details.map((detail, j) => (
+                      <li key={j} className="text-sm text-neutral-600 flex items-start gap-2">
+                        <span className="mt-1.5 w-1 h-1 rounded-full bg-neutral-400 shrink-0" />
+                        {detail}
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              ))}
+            </div>
+            <div className="p-4 bg-neutral-50 border-t border-neutral-100 text-center">
+              <p className="text-xs text-neutral-400">더 나은 서비스를 위해 꾸준히 업데이트 중입니다.</p>
+            </div>
+          </motion.div>
+        </div>
+      )}
 
       {/* API Key Modal */}
       {isKeyModalOpen && (
