@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react';
 import { GoogleGenAI } from '@google/genai';
-import { Key, CheckCircle2, XCircle, Loader2, FileText, Info, PenTool, Send, UploadCloud, X, Briefcase, Copy, Download, Check, ShieldCheck } from 'lucide-react';
+import { Key, CheckCircle2, XCircle, Loader2, FileText, Info, PenTool, Send, UploadCloud, X, Briefcase, Copy, Download, Check, ShieldCheck, Eye, EyeOff, AlertTriangle, ExternalLink } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import rehypeRaw from 'rehype-raw';
@@ -214,6 +214,7 @@ export default function App() {
   const [isKeyModalOpen, setIsKeyModalOpen] = useState(false);
   const [isPatchNotesOpen, setIsPatchNotesOpen] = useState(false);
   const [tempKey, setTempKey] = useState('');
+  const [showKey, setShowKey] = useState(false);
 
   const [announcementFiles, setAnnouncementFiles] = useState<File[]>([]);
   const [templateFiles, setTemplateFiles] = useState<File[]>([]);
@@ -290,8 +291,11 @@ export default function App() {
   }, []);
 
   const handleSaveKey = () => {
-    setApiKey(tempKey);
-    localStorage.setItem('gemini_api_key', tempKey);
+    // 복사·붙여넣기 시 섞여 들어오는 공백/줄바꿈 제거 (API Key 오류 주요 원인)
+    const trimmed = tempKey.trim();
+    setApiKey(trimmed);
+    setTempKey(trimmed);
+    localStorage.setItem('gemini_api_key', trimmed);
     setIsKeyModalOpen(false);
   };
 
@@ -306,6 +310,8 @@ export default function App() {
     }
     if (!apiKey) {
       setError('API Key를 입력해주세요.');
+      setTempKey(apiKey);
+      setShowKey(false);
       setIsKeyModalOpen(true);
       return;
     }
@@ -497,6 +503,7 @@ export default function App() {
           <button
             onClick={() => {
               setTempKey(apiKey);
+              setShowKey(false);
               setIsKeyModalOpen(true);
             }}
             className="flex items-center gap-2 px-3 py-2 rounded-full bg-neutral-100 hover:bg-neutral-200 transition-colors text-xs font-bold shrink-0"
@@ -861,13 +868,51 @@ export default function App() {
             <div className="p-6 space-y-4">
               <div>
                 <label className="block text-sm font-medium text-neutral-700 mb-1">API Key</label>
-                <input
-                  type="password"
-                  value={tempKey}
-                  onChange={(e) => setTempKey(e.target.value)}
-                  placeholder="AIzaSy..."
-                  className="w-full p-3 bg-neutral-50 border border-neutral-200 rounded-xl focus:ring-2 focus:ring-indigo-500 focus:border-transparent"
-                />
+                <div className="relative">
+                  <input
+                    type={showKey ? 'text' : 'password'}
+                    value={tempKey}
+                    onChange={(e) => setTempKey(e.target.value)}
+                    onKeyDown={(e) => { if (e.key === 'Enter' && tempKey.trim()) handleSaveKey(); }}
+                    placeholder="AIzaSy..."
+                    autoComplete="off"
+                    spellCheck={false}
+                    className="w-full p-3 pr-12 bg-neutral-50 border border-neutral-200 rounded-xl focus:ring-2 focus:ring-indigo-500 focus:border-transparent font-mono text-sm"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => setShowKey((v) => !v)}
+                    aria-label={showKey ? 'API Key 숨기기' : 'API Key 표시'}
+                    title={showKey ? '숨기기' : '표시'}
+                    className="absolute right-2 top-1/2 -translate-y-1/2 p-2 text-neutral-400 hover:text-neutral-700 rounded-lg hover:bg-neutral-200/60 transition-colors"
+                  >
+                    {showKey ? <EyeOff className="w-5 h-5" /> : <Eye className="w-5 h-5" />}
+                  </button>
+                </div>
+              </div>
+
+              {/* 주의사항 */}
+              <div className="rounded-xl border border-amber-200 bg-amber-50 p-4">
+                <div className="flex items-center gap-2 mb-2">
+                  <AlertTriangle className="w-4 h-4 text-amber-600 flex-shrink-0" />
+                  <span className="text-sm font-semibold text-amber-800">API Key 오류 방지 체크리스트</span>
+                </div>
+                <ul className="space-y-1.5 text-xs text-amber-800 leading-relaxed list-disc pl-5">
+                  <li><strong>Gemini API Key</strong>가 맞는지 확인하세요. (<code className="px-1 bg-amber-100 rounded">AIzaSy</code>로 시작)</li>
+                  <li>키 <strong>앞뒤 공백·줄바꿈</strong>이 섞이지 않도록 정확히 복사하세요. (저장 시 자동 정리됩니다)</li>
+                  <li>해당 키 프로젝트에서 <strong>Generative Language API가 사용 설정</strong>되어 있어야 합니다.</li>
+                  <li><strong>사용량 한도(429)</strong> 초과 시 잠시 후 재시도하거나 유료 플랜을 설정하세요.</li>
+                  <li>키는 <strong>브라우저(로컬)에만 저장</strong>되며 외부로 전송되지 않습니다.</li>
+                </ul>
+                <a
+                  href="https://aistudio.google.com/app/apikey"
+                  target="_blank"
+                  rel="noreferrer"
+                  className="inline-flex items-center gap-1 mt-3 text-xs font-semibold text-blue-600 hover:underline"
+                >
+                  Google AI Studio에서 API Key 발급/확인
+                  <ExternalLink className="w-3 h-3" />
+                </a>
               </div>
             </div>
             <div className="p-6 bg-neutral-50 border-t border-neutral-100 flex justify-end gap-3">
