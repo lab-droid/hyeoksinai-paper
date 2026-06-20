@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { GoogleGenAI } from '@google/genai';
 import { Key, CheckCircle2, XCircle, Loader2, FileText, Info, PenTool, Send, UploadCloud, X, Briefcase, Copy, Download, Check, ShieldCheck, Eye, EyeOff, AlertTriangle, ExternalLink } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
@@ -229,6 +229,7 @@ export default function App() {
   const [error, setError] = useState('');
   const [isCopied, setIsCopied] = useState(false);
   const [selectedModel, setSelectedModel] = useState<'gemini-3.1-pro-preview' | 'gemini-3-flash-preview'>('gemini-3.1-pro-preview');
+  const resultRef = useRef<HTMLDivElement>(null);
 
   const patchNotes = [
     {
@@ -407,13 +408,46 @@ export default function App() {
     }
   };
 
+  // 화면에 보이는 결과물(서식·색상·표 포함)을 그대로 클립보드에 복사한다.
+  // text/html 로 복사하면 Google Docs·워드 등에 붙여넣을 때 동일하게 재현된다.
   const handleCopy = async () => {
+    const node = resultRef.current;
     try {
-      await navigator.clipboard.writeText(result);
+      if (node && typeof ClipboardItem !== 'undefined' && navigator.clipboard?.write) {
+        // 화면과 동일하게 붙여넣어지도록, 외부 CSS(Tailwind)로만 그려지는 표 테두리 등을
+        // 복제본에 인라인 스타일로 박아 넣는다.
+        const clone = node.cloneNode(true) as HTMLElement;
+        clone.querySelectorAll('table').forEach((t) => {
+          (t as HTMLElement).style.cssText = 'border-collapse:collapse;width:100%;margin:1em 0;';
+        });
+        clone.querySelectorAll('th').forEach((c) => {
+          (c as HTMLElement).style.cssText = 'border:1px solid #d4d4d4;background:#f5f5f5;padding:8px;text-align:left;';
+        });
+        clone.querySelectorAll('td').forEach((c) => {
+          (c as HTMLElement).style.cssText = 'border:1px solid #d4d4d4;padding:8px;vertical-align:top;';
+        });
+        const html = `<div style="font-family:'Malgun Gothic','맑은 고딕',sans-serif;line-height:1.7;color:#374151;">${clone.innerHTML}</div>`;
+        await navigator.clipboard.write([
+          new ClipboardItem({
+            'text/html': new Blob([html], { type: 'text/html' }),
+            'text/plain': new Blob([node.innerText], { type: 'text/plain' }),
+          }),
+        ]);
+      } else {
+        // ClipboardItem 미지원 환경 폴백: 보이는 텍스트라도 복사
+        await navigator.clipboard.writeText(node?.innerText ?? result);
+      }
       setIsCopied(true);
       setTimeout(() => setIsCopied(false), 2000);
     } catch (err) {
-      console.error('Failed to copy text: ', err);
+      console.error('Failed to copy: ', err);
+      try {
+        await navigator.clipboard.writeText(node?.innerText ?? result);
+        setIsCopied(true);
+        setTimeout(() => setIsCopied(false), 2000);
+      } catch (e) {
+        console.error('Fallback copy failed: ', e);
+      }
     }
   };
 
@@ -716,9 +750,18 @@ export default function App() {
                   <Download className="w-4 h-4" />
                   Word 다운로드
                 </button>
+                <a
+                  href="https://docs.google.com/"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="flex items-center gap-2 px-4 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white font-medium text-sm transition-colors"
+                >
+                  <ExternalLink className="w-4 h-4" />
+                  Docs 바로가기
+                </a>
               </div>
             </div>
-            <div className="prose prose-neutral max-w-none prose-headings:font-bold prose-h1:text-3xl prose-h2:text-2xl prose-h3:text-xl prose-p:text-neutral-700 prose-li:text-neutral-700 prose-table:border-collapse prose-table:w-full prose-th:border prose-th:border-neutral-300 prose-th:bg-neutral-100 prose-th:p-3 prose-td:border prose-td:border-neutral-300 prose-td:p-3">
+            <div ref={resultRef} className="prose prose-neutral max-w-none prose-headings:font-bold prose-h1:text-3xl prose-h2:text-2xl prose-h3:text-xl prose-p:text-neutral-700 prose-li:text-neutral-700 prose-table:border-collapse prose-table:w-full prose-th:border prose-th:border-neutral-300 prose-th:bg-neutral-100 prose-th:p-3 prose-td:border prose-td:border-neutral-300 prose-td:p-3">
               <ReactMarkdown remarkPlugins={[remarkGfm]} rehypePlugins={[rehypeRaw]}>{result}</ReactMarkdown>
             </div>
           </motion.section>
@@ -786,8 +829,9 @@ export default function App() {
                       <strong>고득점 사업계획서 생성하기</strong> 버튼을 누르면 AI가 작성을 시작합니다. 완료된 사업계획서는 마크다운 형태로 제공되며, 강조 색상과 표가 깔끔하게 적용되어 있습니다.
                     </p>
                     <ul className="list-disc list-inside mt-2 text-sm text-neutral-500 space-y-1">
-                      <li><strong>복사:</strong> 내용을 클립보드에 복사하여 원하는 곳에 붙여넣을 수 있습니다.</li>
+                      <li><strong>복사:</strong> 화면에 보이는 서식·색상·표 그대로 클립보드에 복사되어, Google Docs·워드 등에 붙여넣으면 동일하게 재현됩니다.</li>
                       <li><strong>Word 다운로드:</strong> 작성된 내용을 .doc 형식의 워드 파일로 즉시 다운로드할 수 있습니다.</li>
+                      <li><strong>Docs 바로가기:</strong> Google Docs를 새 탭으로 열어 복사한 내용을 바로 붙여넣을 수 있습니다.</li>
                     </ul>
                   </div>
                 </div>
