@@ -1,213 +1,29 @@
-import { useState, useEffect, useRef } from 'react';
-import { GoogleGenAI } from '@google/genai';
-import { Key, CheckCircle2, XCircle, Loader2, FileText, Info, PenTool, Send, UploadCloud, X, Briefcase, Copy, Download, Check, ShieldCheck, Eye, EyeOff, AlertTriangle, ExternalLink } from 'lucide-react';
+import { useState, useEffect, useRef, useMemo } from 'react';
+import {
+  Key, CheckCircle2, XCircle, Loader2, FileText, Info, PenTool, Send, Briefcase, Copy, Download,
+  Check, ShieldCheck, Eye, EyeOff, AlertTriangle, ExternalLink, X, Pencil, RefreshCw,
+  Save, FolderOpen, Trash2, FileType2, Printer, MessageSquarePlus, ListChecks, Sparkles,
+} from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import rehypeRaw from 'rehype-raw';
 import { motion } from 'motion/react';
 import { marked } from 'marked';
-import mammoth from 'mammoth';
-import * as cfb from 'cfb';
-import pako from 'pako';
 
-const fileToBase64 = (file: File): Promise<string> => {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.readAsDataURL(file);
-    reader.onload = () => {
-      const result = reader.result as string;
-      resolve(result.split(',')[1]);
-    };
-    reader.onerror = error => reject(error);
-  });
-};
+import FileUploadSection from './components/FileUploadSection';
+import ContentAnalyzer, { compileContentForm } from './components/ContentAnalyzer';
+import EvaluationPanel from './components/EvaluationPanel';
+import {
+  generatePlanStream, evaluateDraft, regenerateSection, refineDraft, translateError,
+  analyzeContentForm,
+  type Evaluation, type InputFiles, type ModelId, type ContentField,
+} from './lib/gemini';
+import { parseSections, sectionToMarkdown, sectionsToMarkdown, sectionTitle } from './lib/sections';
+import { listProjects, saveProject, deleteProject, type SavedProject } from './lib/storage';
+import { downloadDocx, downloadWordHtml, exportPdf } from './lib/export';
 
-const fileToArrayBuffer = (file: File): Promise<ArrayBuffer> => {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.readAsArrayBuffer(file);
-    reader.onload = () => resolve(reader.result as ArrayBuffer);
-    reader.onerror = error => reject(error);
-  });
-};
-
-// PARA_TEXT 내에서 16바이트(8 wchar)를 차지하는 인라인/확장 제어문자 코드
-const HWP_WIDE_CONTROL = new Set([1, 2, 3, 4, 5, 6, 7, 8, 9, 11, 12, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23]);
-const HWPTAG_PARA_TEXT = 67; // HWPTAG_BEGIN(16) + 51
-
-// HWP(.hwp) 바이너리(OLE 복합문서)에서 본문 텍스트만 추출.
-// 헤더의 압축 플래그를 확인해 비압축 저장본도 처리한다.
-const extractHwpText = (buffer: ArrayBuffer): string => {
-  const container: any = cfb.read(new Uint8Array(buffer), { type: 'array' } as any);
-  const header = cfb.find(container, 'FileHeader') || cfb.find(container, 'Root Entry/FileHeader');
-  if (!header) throw new Error('FileHeader not found');
-  const hb: Uint8Array = header.content as Uint8Array;
-  const props = hb[36] | (hb[37] << 8) | (hb[38] << 16) | (hb[39] << 24);
-  const compressed = (props & 0x01) === 1;
-
-  const paragraphs: string[] = [];
-  for (let i = 0; ; i++) {
-    const sec = cfb.find(container, 'BodyText/Section' + i) || cfb.find(container, 'Root Entry/BodyText/Section' + i);
-    if (!sec) break;
-    let data = new Uint8Array(sec.content as Uint8Array);
-    if (compressed) data = pako.inflate(data, { windowBits: -15 });
-    const dv = new DataView(data.buffer, data.byteOffset, data.byteLength);
-
-    let p = 0;
-    while (p + 4 <= data.length) {
-      const recordHeader = dv.getUint32(p, true);
-      p += 4;
-      const tagId = recordHeader & 0x3ff;
-      let size = (recordHeader >> 20) & 0xfff;
-      if (size === 0xfff) {
-        size = dv.getUint32(p, true);
-        p += 4;
-      }
-      if (tagId === HWPTAG_PARA_TEXT) {
-        let line = '';
-        const end = p + size;
-        let q = p;
-        while (q + 2 <= end) {
-          const charCode = dv.getUint16(q, true);
-          q += 2;
-          if (HWP_WIDE_CONTROL.has(charCode)) {
-            q += 14; // 제어문자: 추가 7 wchar 건너뜀
-          } else if (charCode >= 32 || charCode === 9) {
-            line += String.fromCharCode(charCode);
-          }
-        }
-        paragraphs.push(line);
-      }
-      p += size;
-    }
-  }
-  return paragraphs.join('\n').replace(/\n{3,}/g, '\n\n').trim();
-};
-
-// Gemini는 문서 inlineData로 PDF만 지원하므로, DOCX/HWP는 텍스트로 변환해 전송한다.
-const fileToPart = async (file: File): Promise<any> => {
-  const name = file.name.toLowerCase();
-
-  if (name.endsWith('.pdf')) {
-    const base64 = await fileToBase64(file);
-    return { inlineData: { data: base64, mimeType: 'application/pdf' } };
-  }
-
-  if (name.endsWith('.docx')) {
-    const arrayBuffer = await fileToArrayBuffer(file);
-    const { value } = await mammoth.extractRawText({ arrayBuffer });
-    const text = value.trim();
-    if (!text) throw new Error(`'${file.name}'에서 텍스트를 추출하지 못했습니다. PDF로 변환 후 업로드해주세요.`);
-    return { text: `\n[파일: ${file.name}]\n${text}` };
-  }
-
-  if (name.endsWith('.hwp')) {
-    const arrayBuffer = await fileToArrayBuffer(file);
-    let text = '';
-    try {
-      text = extractHwpText(arrayBuffer);
-    } catch {
-      throw new Error(`'${file.name}'(HWP) 파일을 읽지 못했습니다. PDF로 변환 후 업로드해주세요.`);
-    }
-    if (!text) throw new Error(`'${file.name}'(HWP)에서 텍스트를 추출하지 못했습니다. PDF로 변환 후 업로드해주세요.`);
-    return { text: `\n[파일: ${file.name}]\n${text}` };
-  }
-
-  throw new Error(`'${file.name}'은(는) 지원하지 않는 형식입니다. PDF, DOCX, HWP만 업로드할 수 있습니다.`);
-};
-
-const FileUploadSection = ({ title, icon: Icon, colorClass, files, setFiles, required }: any) => {
-  const [isDragging, setIsDragging] = useState(false);
-
-  const handleDragOver = (e: React.DragEvent) => {
-    e.preventDefault();
-    setIsDragging(true);
-  };
-
-  const handleDragLeave = (e: React.DragEvent) => {
-    e.preventDefault();
-    setIsDragging(false);
-  };
-
-  const handleDrop = (e: React.DragEvent) => {
-    e.preventDefault();
-    setIsDragging(false);
-    if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
-      const droppedFiles = Array.from(e.dataTransfer.files).filter(file => 
-        file.name.toLowerCase().endsWith('.pdf') || 
-        file.name.toLowerCase().endsWith('.docx') || 
-        file.name.toLowerCase().endsWith('.hwp')
-      );
-      if (droppedFiles.length > 0) {
-        setFiles((prev: File[]) => [...prev, ...droppedFiles]);
-      }
-    }
-  };
-
-  return (
-    <div className="bg-white p-6 rounded-2xl shadow-sm border border-neutral-200 flex flex-col h-full">
-      <div className="flex items-center gap-2 mb-4">
-        <Icon className={`w-5 h-5 ${colorClass}`} />
-        <h3 className="font-semibold text-neutral-900">{title} {required && <span className="text-rose-500">*</span>}</h3>
-      </div>
-      <div className="mb-4">
-        <label 
-          onDragOver={handleDragOver}
-          onDragLeave={handleDragLeave}
-          onDrop={handleDrop}
-          className={`flex flex-col items-center justify-center w-full h-32 border-2 border-dashed rounded-xl cursor-pointer transition-colors ${
-            isDragging ? 'border-blue-500 bg-blue-50' :
-            files.length > 0 ? 'border-emerald-400 bg-emerald-50 hover:bg-emerald-100' : 'border-neutral-300 bg-neutral-50 hover:bg-neutral-100'
-          }`}
-        >
-          <div className="flex flex-col items-center justify-center pt-4 pb-4">
-            {files.length > 0 ? (
-              <>
-                <CheckCircle2 className="w-6 h-6 text-emerald-500 mb-2" />
-                <p className="text-sm text-emerald-700 font-medium">{files.length}개의 파일 첨부됨</p>
-                <p className="text-xs text-emerald-600/70 mt-1 text-center">클릭하거나 드래그하여 추가 업로드</p>
-              </>
-            ) : (
-              <>
-                <UploadCloud className={`w-6 h-6 mb-2 ${isDragging ? 'text-blue-500' : 'text-neutral-400'}`} />
-                <p className={`text-sm font-medium ${isDragging ? 'text-blue-600' : 'text-neutral-600'} text-center px-4`}>
-                  {isDragging ? '여기에 파일을 놓으세요' : '클릭하거나 파일을 드래그하여 업로드'}
-                </p>
-                <p className="text-xs text-neutral-400 mt-1">PDF, DOCX, HWP 지원</p>
-              </>
-            )}
-          </div>
-          <input
-            type="file"
-            className="hidden"
-            accept=".pdf,.docx,.hwp"
-            multiple
-            onChange={(e) => {
-              if (e.target.files && e.target.files.length > 0) {
-                const selectedFiles = Array.from(e.target.files);
-                setFiles((prev: File[]) => [...prev, ...selectedFiles]);
-              }
-              e.target.value = '';
-            }}
-          />
-        </label>
-        <p className="text-[11px] text-neutral-400 mt-2 text-center break-keep">※ HWP, DOCX는 인식률을 위해 가급적 PDF 변환 후 업로드를 권장합니다.</p>
-      </div>
-      {files.length > 0 && (
-        <div className="flex flex-wrap gap-2">
-          {files.map((file: File, idx: number) => (
-            <div key={idx} className="flex items-center gap-1 bg-neutral-100 px-2.5 py-1.5 rounded-lg text-xs border border-neutral-200">
-              <span className="truncate max-w-[160px] font-medium text-neutral-700" title={file.name}>{file.name}</span>
-              <button onClick={() => setFiles((prev: File[]) => prev.filter((_, i) => i !== idx))} className="text-neutral-400 hover:text-red-500 p-0.5 transition-colors">
-                <X className="w-3.5 h-3.5" />
-              </button>
-            </div>
-          ))}
-        </div>
-      )}
-    </div>
-  );
-};
+type View = 'input' | 'generating' | 'result' | 'guide';
+type GenLabel = '생성' | '수정' | '보강';
 
 export default function App() {
   const [apiKey, setApiKey] = useState('');
@@ -220,79 +36,105 @@ export default function App() {
   const [templateFiles, setTemplateFiles] = useState<File[]>([]);
   const [infoFiles, setInfoFiles] = useState<File[]>([]);
   const [criteriaFiles, setCriteriaFiles] = useState<File[]>([]);
+
+  const [inputMode, setInputMode] = useState<'analyze' | 'simple'>('analyze');
   const [content, setContent] = useState('');
 
-  const [isGenerating, setIsGenerating] = useState(false);
-  const [currentView, setCurrentView] = useState<'input' | 'generating' | 'result' | 'guide'>('input');
-  const [progress, setProgress] = useState(0);
+  // AI 분석 → 전반적인 내용 양식
+  const [analyzeSeed, setAnalyzeSeed] = useState('');
+  const [contentAnalysis, setContentAnalysis] = useState('');
+  const [contentFields, setContentFields] = useState<ContentField[]>([]);
+  const [contentAnswers, setContentAnswers] = useState<Record<number, string>>({});
+  const [isAnalyzing, setIsAnalyzing] = useState(false);
+
+  const [currentView, setCurrentView] = useState<View>('input');
+  const [genLabel, setGenLabel] = useState<GenLabel>('생성');
+  const [streamingText, setStreamingText] = useState('');
   const [result, setResult] = useState('');
   const [error, setError] = useState('');
   const [isCopied, setIsCopied] = useState(false);
-  const [selectedModel, setSelectedModel] = useState<'gemini-3.1-pro-preview' | 'gemini-3-flash-preview'>('gemini-3.1-pro-preview');
-  const resultRef = useRef<HTMLDivElement>(null);
+  // 항상 최고 품질 모델 사용 (모델 선택 UI 제거됨)
+  const selectedModel: ModelId = 'gemini-3.1-pro-preview';
+
+  // 평가
+  const [evaluation, setEvaluation] = useState<Evaluation | null>(null);
+  const [isEvaluating, setIsEvaluating] = useState(false);
+
+  // 섹션 편집/재생성
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [editBuffer, setEditBuffer] = useState('');
+  const [regenForId, setRegenForId] = useState<string | null>(null);
+  const [regenText, setRegenText] = useState('');
+  const [busySectionId, setBusySectionId] = useState<string | null>(null);
+
+  // 대화형 보완
+  const [refineInput, setRefineInput] = useState('');
+
+  // 프로젝트 저장/불러오기
+  const [projects, setProjects] = useState<SavedProject[]>([]);
+  const [currentProjectId, setCurrentProjectId] = useState<string | undefined>(undefined);
+  const [isProjectsOpen, setIsProjectsOpen] = useState(false);
+  const [justSaved, setJustSaved] = useState(false);
+
+  const streamRef = useRef<HTMLDivElement>(null);
+
+  const sections = useMemo(() => parseSections(result), [result]);
+  const inputFiles: InputFiles = { announcementFiles, templateFiles, infoFiles, criteriaFiles };
 
   const patchNotes = [
     {
+      date: '2026-06-21',
+      title: '처음부터 마무리까지 — 올인원 대규모 업데이트',
+      details: [
+        'AI 평가위원 자가 채점(항목별 점수·개선점·보강 버튼) 추가',
+        '실시간 스트리밍 생성 + 섹션별 다시쓰기/편집 기능',
+        '대화형 보완(요청으로 전체 수정) 추가',
+        '정식 .docx 및 PDF 내보내기 추가',
+        '프로젝트 저장/불러오기(브라우저 보관) 추가',
+        '가이드형 입력 위저드(단계별 항목 입력) 추가',
+      ],
+    },
+    {
       date: '2026-04-19',
       title: '패치노트 및 API 비용 안내 추가',
-      details: [
-        '상단 헤더에 패치노트 확인 기능 추가',
-        '예상 API 사용 비용(KRW) 안내 섹션 추가',
-        'UI 레이아웃 최적화'
-      ]
+      details: ['상단 헤더에 패치노트 확인 기능 추가', '예상 API 사용 비용(KRW) 안내 섹션 추가', 'UI 레이아웃 최적화'],
     },
     {
       date: '2026-03-24',
       title: '입력 방식 개편 및 운영 기준 추가',
-      details: [
-        '운영 기준 항목(파일 첨부) 추가',
-        '모든 입력 항목을 파일 첨부 중심으로 UI 전면 개편',
-        '전반적인 내용(필수) 항목의 편의성 개선',
-        '홈 이동 시 데이터 초기화 로직 보강'
-      ]
+      details: ['운영 기준 항목(파일 첨부) 추가', '모든 입력 항목을 파일 첨부 중심으로 UI 전면 개편', '전반적인 내용(필수) 항목의 편의성 개선', '홈 이동 시 데이터 초기화 로직 보강'],
     },
     {
       date: '2026-03-22',
       title: '모델 선택 및 사용 가이드 추가',
-      details: [
-        'Gemini 1.5 Pro / Flash 모델 선택 기능 추가 (할당량 대응)',
-        '상단 네비게이션(홈, 사용방법) 추가 및 가이드 페이지 구현',
-        'API 할당량 초과(429) 및 오류 메시지 시각화 개선',
-        '헤더 로고 클릭 시 홈 이동 기능 추가'
-      ]
+      details: ['Pro / Flash 모델 선택 기능 추가 (할당량 대응)', '상단 네비게이션(홈, 사용방법) 추가 및 가이드 페이지 구현', 'API 할당량 초과(429) 및 오류 메시지 시각화 개선', '헤더 로고 클릭 시 홈 이동 기능 추가'],
     },
     {
       date: '2026-03-21',
       title: '출력 포맷 및 시각화 강화',
-      details: [
-        '표(Table) 테두리 선 및 스타일 적용 (Typography 플러그인)',
-        '강조 텍스트 색상(빨강, 파랑, 초록) 및 Bold 자동 적용',
-        '이미지 삽입 가이드 Placeholder 생성 로직 추가',
-        '생성 진행률(%) 시각화 및 화면 전환 UX 적용'
-      ]
+      details: ['표(Table) 테두리 선 및 스타일 적용 (Typography 플러그인)', '강조 텍스트 색상 및 Bold 자동 적용', '이미지 삽입 가이드 Placeholder 생성 로직 추가', '생성 진행률 시각화 및 화면 전환 UX 적용'],
     },
     {
       date: '2026-03-15',
       title: '초기 런칭',
-      details: [
-        'Gemini AI 기반 고득점 사업계획서 생성 엔진 탑재',
-        'PDF, DOCX, HWP 파일 분석 기능',
-        'Word(.doc) 다운로드 및 클립보드 복사 기능'
-      ]
-    }
+      details: ['Gemini AI 기반 고득점 사업계획서 생성 엔진 탑재', 'PDF, DOCX, HWP 파일 분석 기능', 'Word 다운로드 및 클립보드 복사 기능'],
+    },
   ];
 
   useEffect(() => {
     const storedKey = localStorage.getItem('gemini_api_key');
-    if (storedKey) {
-      setApiKey(storedKey);
-    } else if (process.env.GEMINI_API_KEY) {
-      setApiKey(process.env.GEMINI_API_KEY);
-    }
+    if (storedKey) setApiKey(storedKey);
+    else if (process.env.GEMINI_API_KEY) setApiKey(process.env.GEMINI_API_KEY);
+    setProjects(listProjects());
   }, []);
 
+  useEffect(() => {
+    if (currentView === 'generating' && streamRef.current) {
+      streamRef.current.scrollTop = streamRef.current.scrollHeight;
+    }
+  }, [streamingText, currentView]);
+
   const handleSaveKey = () => {
-    // 복사·붙여넣기 시 섞여 들어오는 공백/줄바꿈 제거 (API Key 오류 주요 원인)
     const trimmed = tempKey.trim();
     setApiKey(trimmed);
     setTempKey(trimmed);
@@ -300,190 +142,233 @@ export default function App() {
     setIsKeyModalOpen(false);
   };
 
-  const handleGenerate = async () => {
-    if (templateFiles.length === 0) {
-      setError('사업계획서 양식을 파일로 첨부해주세요.');
-      return;
-    }
-    if (!content) {
-      setError('전반적인 내용을 입력해주세요.');
-      return;
-    }
+  const requireKey = (): boolean => {
     if (!apiKey) {
       setError('API Key를 입력해주세요.');
       setTempKey(apiKey);
       setShowKey(false);
       setIsKeyModalOpen(true);
-      return;
+      return false;
     }
+    return true;
+  };
 
-    setIsGenerating(true);
-    setCurrentView('generating');
-    setProgress(0);
+  // ── AI 분석 → 전반적인 내용 양식 생성 ──
+  const handleAnalyze = async () => {
+    if (templateFiles.length === 0) { setError("먼저 '사업계획서 양식(필수)'을 업로드해주세요."); return; }
+    if (!requireKey()) return;
     setError('');
-    setResult('');
-
-    const progressInterval = setInterval(() => {
-      setProgress((prev) => {
-        if (prev >= 95) return prev;
-        const increment = Math.max(1, (95 - prev) * 0.1);
-        return prev + increment;
-      });
-    }, 500);
-
+    setIsAnalyzing(true);
     try {
-      const ai = new GoogleGenAI({ apiKey });
-      const parts: any[] = [];
-
-      parts.push({ text: '당신은 정부지원사업 및 투자 유치를 위한 최고 수준의 사업계획서 작성 전문가입니다. 서류평가위원에게 높은 고득점을 받을 수 있도록 논리적이고 설득력 있게, 그리고 전문적인 용어를 사용하여 작성해야 합니다.\n\n다음 정보를 바탕으로 사업계획서를 작성해주세요.' });
-
-      if (announcementFiles.length > 0) {
-        parts.push({ text: '\n\n[모집공고 양식 및 내용]' });
-        for (const file of announcementFiles) {
-          parts.push(await fileToPart(file));
-        }
-      }
-
-      if (templateFiles.length > 0) {
-        parts.push({ text: '\n\n[사업계획서 양식]' });
-        for (const file of templateFiles) {
-          parts.push(await fileToPart(file));
-        }
-      }
-
-      if (infoFiles.length > 0) {
-        parts.push({ text: '\n\n[사업계획서 관련 정보]' });
-        for (const file of infoFiles) {
-          parts.push(await fileToPart(file));
-        }
-      }
-
-      if (criteriaFiles.length > 0) {
-        parts.push({ text: '\n\n[운영 기준 항목]' });
-        for (const file of criteriaFiles) {
-          parts.push(await fileToPart(file));
-        }
-      }
-
-      parts.push({ text: `\n\n[전반적인 내용]\n${content}\n\n작성 지침:\n1. 제공된 '사업계획서 양식'의 목차와 구조를 기본으로 하되, **제공된 '사업계획서 관련 정보' 및 '운영 기준 항목'의 내용을 심층적으로 분석하여 기존 양식에 없는 새로운 '추가 항목(목차)'을 반드시 1개 이상 생성하여 적절한 위치에 포함시킬 것.**\n2. '모집공고 양식'이 제공된 경우, 해당 공고의 평가 기준과 요구사항을 철저히 반영할 것.\n3. **[중요] 서류평가위원에게 고득점을 받기 위해 필수적인 항목(예: 구체적인 수익 모델, 경쟁사 대비 차별화 전략, 리스크 관리 및 대응 방안, 팀 역량 및 네트워크 등)을 AI가 스스로 분석하여, 기존 양식에 누락되어 있다면 적절한 위치에 추가하여 작성할 것.**\n4. **[중요] '추가 인원 채용 계획' 항목이 있다면, 정부지원사업에서 높은 점수(일자리 창출 지표)를 받을 수 있도록 사업 규모와 성장 단계에 맞는 타당하고 전략적인 인원 수와 직무(예: 핵심 개발자, 마케팅 전문가 등)를 선정하여 구체적으로 작성할 것.**\n5. **[매우 중요] 표(Table)가 필요한 문장이나 항목(예: 자금소요계획, 추진일정, 인력현황, 경쟁사 비교 등)은 반드시 마크다운 표 형식으로 구성하여 보여줄 것. 표 작성 시 내용이 비어있거나 투명한 표가 아닌, 반드시 모든 셀에 구체적인 내용이 채워진 완전한 표 형식으로 작성할 것.**\n6. 평가위원이 한눈에 파악할 수 있도록 가독성 높게 작성할 것. 문항마다 문단을 명확히 나누어 작성할 것.\n7. **[중요] 강조할 텍스트는 빨간색, 진한 파란색, 진한 초록색 색상을 적절하게 섞어서 작성할 것. 색상 적용 시 반드시 HTML 태그를 사용할 것 (예: <span style="color: red;">강조내용</span>). 굵은 글씨(Bold)가 필요한 경우 \`**\` 기호 대신 \`<strong>\` 태그를 사용할 것.**\n8. 일반 본문에서 줄바꿈이 필요하다면 마크다운의 문단 띄어쓰기(엔터 두 번)를 사용할 것. **단, 마크다운 표(\`|\`로 구분되는 표) 내부의 셀 안에서 줄바꿈이 필요할 때는 반드시 \`<br>\` 태그를 사용할 것.** 표 위아래로는 반드시 빈 줄을 하나씩 넣어서 표가 깨지지 않게 할 것.\n9. **[중요] 이미지가 포함되면 좋은 곳(예: 서비스 흐름도, 제품 사진, 시스템 아키텍처 등)은 반드시 \`[이미지 : (들어갈 이미지에 대한 상세 설명)]\` 형식으로 본문에 포함시킬 것.**\n10. "여기 사업계획서 초안입니다"와 같은 인사말이나 마크다운 문법에 대한 설명 등 불필요한 내용은 일절 제외하고, 오직 사업계획서 본문 내용만 바로 출력할 것.` });
-
-      const response = await ai.models.generateContent({
-        model: selectedModel,
-        contents: { parts },
-      });
-
-      clearInterval(progressInterval);
-      setProgress(100);
-
-      let generatedText = response.text || '';
-      
-      // **텍스트** 를 <strong>텍스트</strong>로 변환 (마크다운 파싱 오류 방지 및 ** 기호 숨김)
-      generatedText = generatedText.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
-
-      setResult(generatedText);
-      
-      setTimeout(() => {
-        setCurrentView('result');
-        setIsGenerating(false);
-      }, 500);
-
+      const res = await analyzeContentForm({ apiKey, model: selectedModel, files: inputFiles, seed: analyzeSeed });
+      if (res.fields.length === 0) { setError('양식을 만들지 못했습니다. 다시 시도해주세요.'); return; }
+      setContentAnalysis(res.analysis);
+      setContentFields(res.fields);
+      setContentAnswers({});
     } catch (err: any) {
-      clearInterval(progressInterval);
-      console.error('Generation Error:', err);
-      
-      let errorMessage = '오류가 발생했습니다. 파일 형식이 지원되지 않거나 API Key를 확인해주세요.';
-      
-      // Handle Quota Exceeded (429) error
-      if (err.message?.includes('quota') || err.message?.includes('429') || err.message?.includes('RESOURCE_EXHAUSTED')) {
-        errorMessage = 'API 사용량이 한도를 초과했습니다. 잠시 후 다시 시도하시거나, 유료 플랜(Pay-as-you-go) 설정 또는 다른 API Key 사용을 권장합니다.';
-      } else if (err.message?.includes('API key not valid')) {
-        errorMessage = '유효하지 않은 API Key입니다. 키를 다시 확인해주세요.';
-      } else if (err.message) {
-        errorMessage = `오류: ${err.message}`;
-      }
-
-      setError(errorMessage);
-      setCurrentView('input');
-      setIsGenerating(false);
+      console.error('Analyze Error:', err);
+      setError(translateError(err));
+    } finally {
+      setIsAnalyzing(false);
     }
   };
 
-  // 화면에 보이는 결과물(서식·색상·표 포함)을 그대로 클립보드에 복사한다.
-  // text/html 로 복사하면 Google Docs·워드 등에 붙여넣을 때 동일하게 재현된다.
-  const handleCopy = async () => {
-    const node = resultRef.current;
+  // ── 전체 생성 ──
+  const handleGenerate = async () => {
+    if (templateFiles.length === 0) { setError('사업계획서 양식을 파일로 첨부해주세요.'); return; }
+    const compiledContent =
+      inputMode === 'analyze' ? compileContentForm(analyzeSeed, contentFields, contentAnswers)
+      : content;
+    if (!compiledContent.trim()) {
+      setError(
+        inputMode === 'analyze'
+          ? '먼저 분석으로 양식을 만들고, 한 줄 아이디어나 항목을 하나 이상 작성해주세요.'
+          : '전반적인 내용을 입력해주세요.',
+      );
+      return;
+    }
+    if (!requireKey()) return;
+
+    setError('');
+    setEvaluation(null);
+    setCurrentProjectId(undefined);
+    setGenLabel('생성');
+    setStreamingText('');
+    setCurrentView('generating');
+
     try {
-      if (node && typeof ClipboardItem !== 'undefined' && navigator.clipboard?.write) {
-        // 화면과 동일하게 붙여넣어지도록, 외부 CSS(Tailwind)로만 그려지는 표 테두리 등을
-        // 복제본에 인라인 스타일로 박아 넣는다.
-        const clone = node.cloneNode(true) as HTMLElement;
-        clone.querySelectorAll('table').forEach((t) => {
-          (t as HTMLElement).style.cssText = 'border-collapse:collapse;width:100%;margin:1em 0;';
-        });
-        clone.querySelectorAll('th').forEach((c) => {
-          (c as HTMLElement).style.cssText = 'border:1px solid #d4d4d4;background:#f5f5f5;padding:8px;text-align:left;';
-        });
-        clone.querySelectorAll('td').forEach((c) => {
-          (c as HTMLElement).style.cssText = 'border:1px solid #d4d4d4;padding:8px;vertical-align:top;';
-        });
-        const html = `<div style="font-family:'Malgun Gothic','맑은 고딕',sans-serif;line-height:1.7;color:#374151;">${clone.innerHTML}</div>`;
+      const text = await generatePlanStream({
+        apiKey, model: selectedModel, files: inputFiles, content: compiledContent,
+        onChunk: setStreamingText,
+      });
+      setResult(text);
+      setCurrentView('result');
+      window.scrollTo({ top: 0, behavior: 'smooth' });
+    } catch (err: any) {
+      console.error('Generation Error:', err);
+      setError(translateError(err));
+      setCurrentView('input');
+    }
+  };
+
+  // ── 자가 평가 ──
+  const handleEvaluate = async () => {
+    if (!requireKey() || !result) return;
+    setIsEvaluating(true);
+    try {
+      const evalResult = await evaluateDraft({ apiKey, model: selectedModel, files: inputFiles, draft: result });
+      setEvaluation(evalResult);
+    } catch (err: any) {
+      console.error('Evaluation Error:', err);
+      setError(translateError(err));
+    } finally {
+      setIsEvaluating(false);
+    }
+  };
+
+  // ── 섹션 재생성(공통) ──
+  const replaceSectionMarkdown = (index: number, newMarkdown: string) => {
+    const arr = sections.map(sectionToMarkdown);
+    arr[index] = newMarkdown.trim();
+    setResult(arr.join('\n\n').replace(/\n{3,}/g, '\n\n').trim());
+  };
+
+  const runRegenerate = async (sectionId: string, instruction: string) => {
+    if (!requireKey()) return;
+    const index = sections.findIndex(s => s.id === sectionId);
+    if (index < 0) return;
+    const section = sections[index];
+    setBusySectionId(sectionId);
+    setRegenForId(null);
+    setRegenText('');
+    try {
+      const newMd = await regenerateSection({
+        apiKey, model: selectedModel, files: inputFiles, fullDraft: result,
+        sectionHeading: sectionTitle(section), sectionContent: sectionToMarkdown(section), instruction,
+      });
+      if (newMd.trim()) replaceSectionMarkdown(index, newMd);
+    } catch (err: any) {
+      console.error('Section Regen Error:', err);
+      setError(translateError(err));
+    } finally {
+      setBusySectionId(null);
+    }
+  };
+
+  // 평가 패널의 '보강' 버튼: 제목으로 섹션을 찾아 기본 지시로 재생성
+  const handleReinforce = (sectionName: string) => {
+    const target = sections.find(s => sectionTitle(s).includes(sectionName) || sectionName.includes(sectionTitle(s)));
+    if (!target) { setError(`'${sectionName}' 섹션을 본문에서 찾지 못했습니다. 해당 섹션의 '다시쓰기'를 직접 사용해주세요.`); return; }
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+    runRegenerate(target.id, `평가위원 피드백을 반영하여 이 섹션을 더 구체적이고 설득력 있게, 정량 지표와 근거를 보강하여 다시 작성해주세요.`);
+  };
+
+  // ── 인라인 편집 ──
+  const startEdit = (id: string, markdown: string) => { setEditingId(id); setEditBuffer(markdown); };
+  const saveEdit = () => {
+    if (!editingId) return;
+    const index = sections.findIndex(s => s.id === editingId);
+    if (index >= 0) replaceSectionMarkdown(index, editBuffer);
+    setEditingId(null);
+    setEditBuffer('');
+  };
+
+  // ── 대화형 보완(전체 수정) ──
+  const handleRefine = async () => {
+    const instruction = refineInput.trim();
+    if (!instruction || !result) return;
+    if (!requireKey()) return;
+    setRefineInput('');
+    setGenLabel('수정');
+    setStreamingText('');
+    setCurrentView('generating');
+    try {
+      const text = await refineDraft({
+        apiKey, model: selectedModel, files: inputFiles, fullDraft: result, instruction, onChunk: setStreamingText,
+      });
+      setResult(text);
+      setEvaluation(null);
+      setCurrentView('result');
+    } catch (err: any) {
+      console.error('Refine Error:', err);
+      setError(translateError(err));
+      setCurrentView('result');
+    }
+  };
+
+  // ── 복사: 화면 서식 그대로 클립보드 ──
+  const styledHtml = (): string => {
+    const html = marked.parse(result, { async: false, gfm: true }) as string;
+    const doc = new DOMParser().parseFromString(html, 'text/html');
+    doc.querySelectorAll('table').forEach(t => t.setAttribute('style', 'border-collapse:collapse;width:100%;margin:1em 0;'));
+    doc.querySelectorAll('th').forEach(c => c.setAttribute('style', 'border:1px solid #d4d4d4;background:#f5f5f5;padding:8px;text-align:left;'));
+    doc.querySelectorAll('td').forEach(c => c.setAttribute('style', 'border:1px solid #d4d4d4;padding:8px;vertical-align:top;'));
+    return `<div style="font-family:'Malgun Gothic','맑은 고딕',sans-serif;line-height:1.7;color:#374151;">${doc.body.innerHTML}</div>`;
+  };
+
+  const handleCopy = async () => {
+    try {
+      const html = styledHtml();
+      const plain = new DOMParser().parseFromString(html, 'text/html').body.innerText;
+      if (typeof ClipboardItem !== 'undefined' && navigator.clipboard?.write) {
         await navigator.clipboard.write([
           new ClipboardItem({
             'text/html': new Blob([html], { type: 'text/html' }),
-            'text/plain': new Blob([node.innerText], { type: 'text/plain' }),
+            'text/plain': new Blob([plain], { type: 'text/plain' }),
           }),
         ]);
       } else {
-        // ClipboardItem 미지원 환경 폴백: 보이는 텍스트라도 복사
-        await navigator.clipboard.writeText(node?.innerText ?? result);
+        await navigator.clipboard.writeText(plain);
       }
       setIsCopied(true);
       setTimeout(() => setIsCopied(false), 2000);
     } catch (err) {
       console.error('Failed to copy: ', err);
-      try {
-        await navigator.clipboard.writeText(node?.innerText ?? result);
-        setIsCopied(true);
-        setTimeout(() => setIsCopied(false), 2000);
-      } catch (e) {
-        console.error('Fallback copy failed: ', e);
-      }
     }
+  };
+
+  // ── 프로젝트 저장/불러오기 ──
+  const handleSaveProject = () => {
+    if (!result) return;
+    const name =
+      analyzeSeed.trim() ||
+      (content.split('\n')[0] || '').slice(0, 40).trim() ||
+      (sections[0] ? sectionTitle(sections[0]) : '') ||
+      '제목 없는 사업계획서';
+    const saved = saveProject({
+      id: currentProjectId, name, content,
+      result, evaluation, model: selectedModel,
+    });
+    setCurrentProjectId(saved.id);
+    setProjects(listProjects());
+    setJustSaved(true);
+    setTimeout(() => setJustSaved(false), 2000);
+  };
+
+  const handleLoadProject = (p: SavedProject) => {
+    setContent(p.content);
+    setInputMode('simple');
+    setResult(p.result);
+    setEvaluation(p.evaluation);
+    setCurrentProjectId(p.id);
+    setIsProjectsOpen(false);
+    setCurrentView('result');
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+  };
+
+  const handleDeleteProject = (id: string) => {
+    deleteProject(id);
+    setProjects(listProjects());
+    if (currentProjectId === id) setCurrentProjectId(undefined);
   };
 
   const handleGoHome = () => {
     setCurrentView('input');
-    setAnnouncementFiles([]);
-    setTemplateFiles([]);
-    setInfoFiles([]);
-    setCriteriaFiles([]);
-    setContent('');
-    setResult('');
-    setProgress(0);
+    setAnnouncementFiles([]); setTemplateFiles([]); setInfoFiles([]); setCriteriaFiles([]);
+    setContent(''); setResult(''); setEvaluation(null);
+    setAnalyzeSeed(''); setContentAnalysis(''); setContentFields([]); setContentAnswers({});
+    setCurrentProjectId(undefined); setError('');
     window.scrollTo({ top: 0, behavior: 'smooth' });
-  };
-
-  const handleDownloadWord = async () => {
-    try {
-      const htmlContent = await marked.parse(result);
-      const header = "<html xmlns:o='urn:schemas-microsoft-com:office:office' xmlns:w='urn:schemas-microsoft-com:office:word' xmlns='http://www.w3.org/TR/REC-html40'><head><meta charset='utf-8'><title>사업계획서</title><style>body { font-family: 'Malgun Gothic', '맑은 고딕', sans-serif; line-height: 1.6; } h1, h2, h3 { color: #333; } p { margin-bottom: 1em; }</style></head><body>";
-      const footer = "</body></html>";
-      const sourceHTML = header + htmlContent + footer;
-
-      const blob = new Blob(['\ufeff', sourceHTML], {
-        type: 'application/msword'
-      });
-      const url = URL.createObjectURL(blob);
-      const link = document.createElement('a');
-      link.href = url;
-      link.download = '사업계획서.doc';
-      document.body.appendChild(link);
-      link.click();
-      document.body.removeChild(link);
-      URL.revokeObjectURL(url);
-    } catch (err) {
-      console.error('Failed to download word file: ', err);
-    }
   };
 
   return (
@@ -491,34 +376,18 @@ export default function App() {
       {/* Header */}
       <header className="sticky top-0 z-50 bg-white/80 backdrop-blur-md border-b border-neutral-200 px-6 py-4 flex justify-between items-center">
         <div className="flex items-center gap-8">
-          <button 
-            onClick={handleGoHome}
-            className="flex items-center gap-2 hover:opacity-80 transition-opacity text-left"
-          >
+          <button onClick={handleGoHome} className="flex items-center gap-2 hover:opacity-80 transition-opacity text-left">
             <FileText className="w-6 h-6 text-neutral-800" />
             <h1 className="text-xl font-bold tracking-tight text-neutral-900 hidden lg:block">혁신 사업계획서 작성 AI</h1>
           </button>
           <nav className="flex items-center gap-6">
-            <button
-              onClick={handleGoHome}
-              className={`text-sm font-semibold transition-colors ${currentView !== 'guide' ? 'text-neutral-900' : 'text-neutral-500 hover:text-neutral-900'}`}
-            >
-              홈
-            </button>
-            <button
-              onClick={() => {
-                setCurrentView('guide');
-                window.scrollTo({ top: 0, behavior: 'smooth' });
-              }}
-              className={`text-sm font-semibold transition-colors ${currentView === 'guide' ? 'text-neutral-900' : 'text-neutral-500 hover:text-neutral-900'}`}
-            >
-              사용방법
-            </button>
+            <button onClick={handleGoHome} className={`text-sm font-semibold transition-colors ${currentView !== 'guide' ? 'text-neutral-900' : 'text-neutral-500 hover:text-neutral-900'}`}>홈</button>
+            <button onClick={() => { setIsProjectsOpen(true); setProjects(listProjects()); }} className="text-sm font-semibold text-neutral-500 hover:text-neutral-900 transition-colors hidden sm:block">내 사업계획서</button>
+            <button onClick={() => { setCurrentView('guide'); window.scrollTo({ top: 0, behavior: 'smooth' }); }} className={`text-sm font-semibold transition-colors ${currentView === 'guide' ? 'text-neutral-900' : 'text-neutral-500 hover:text-neutral-900'}`}>사용방법</button>
           </nav>
         </div>
-        
+
         <div className="flex items-center gap-3">
-          {/* API Cost Info */}
           <div className="hidden md:flex flex-col items-end mr-2 text-[10px] text-neutral-500">
             <div className="flex items-center gap-1">
               <span className="font-bold text-neutral-700">예상 API 비용:</span>
@@ -526,168 +395,73 @@ export default function App() {
             </div>
             <p className="opacity-70 whitespace-nowrap">※ 결과물 길이에 따라 오차 발생 가능</p>
           </div>
-
-          <button
-            onClick={() => setIsPatchNotesOpen(true)}
-            className="flex items-center gap-2 px-3 py-2 rounded-full bg-neutral-100 hover:bg-neutral-200 transition-colors text-xs font-semibold text-neutral-700"
-          >
-            패치노트
-          </button>
-
-          <button
-            onClick={() => {
-              setTempKey(apiKey);
-              setShowKey(false);
-              setIsKeyModalOpen(true);
-            }}
-            className="flex items-center gap-2 px-3 py-2 rounded-full bg-neutral-100 hover:bg-neutral-200 transition-colors text-xs font-bold shrink-0"
-          >
+          <button onClick={() => setIsPatchNotesOpen(true)} className="flex items-center gap-2 px-3 py-2 rounded-full bg-neutral-100 hover:bg-neutral-200 transition-colors text-xs font-semibold text-neutral-700">패치노트</button>
+          <button onClick={() => { setTempKey(apiKey); setShowKey(false); setIsKeyModalOpen(true); }} className="flex items-center gap-2 px-3 py-2 rounded-full bg-neutral-100 hover:bg-neutral-200 transition-colors text-xs font-bold shrink-0">
             <Key className="w-3.5 h-3.5" />
             <span className="hidden sm:inline">API Key</span>
-            {apiKey ? (
-              <CheckCircle2 className="w-3.5 h-3.5 text-emerald-500" />
-            ) : (
-              <XCircle className="w-3.5 h-3.5 text-red-500" />
-            )}
+            {apiKey ? <CheckCircle2 className="w-3.5 h-3.5 text-emerald-500" /> : <XCircle className="w-3.5 h-3.5 text-red-500" />}
           </button>
         </div>
       </header>
 
-      <main className="max-w-5xl mx-auto px-6 py-8 space-y-8">
+      <main className="max-w-4xl mx-auto px-6 py-8 space-y-5">
         {currentView === 'input' && (
           <>
-            {/* Hero Section */}
-            <section className="relative w-full aspect-video max-h-[320px] rounded-3xl overflow-hidden shadow-xl">
-              <img
-                src="https://images.unsplash.com/photo-1454165804606-c3d57bc86b40?q=80&w=2070&auto=format&fit=crop"
-                alt="Business Planning"
-                className="absolute inset-0 w-full h-full object-cover"
-                referrerPolicy="no-referrer"
-              />
-              <div className="absolute inset-0 bg-gradient-to-t from-neutral-900/90 via-neutral-900/40 to-transparent flex flex-col justify-end p-10">
-                <motion.h2
-                  initial={{ opacity: 0, y: 20 }}
-                  animate={{ opacity: 1, y: 0 }}
-                  className="text-3xl md:text-4xl font-bold text-white mb-3 tracking-tight"
-                >
-                  혁신 사업계획서 작성 AI
-                </motion.h2>
-                <motion.p
-                  initial={{ opacity: 0, y: 20 }}
-                  animate={{ opacity: 1, y: 0 }}
-                  transition={{ delay: 0.1 }}
-                  className="text-base text-neutral-200 max-w-2xl"
-                >
-                  평가위원의 마음을 사로잡는 완벽한 사업계획서. 모집공고와 양식을 업로드하면, 고득점을 위한 전문적인 사업계획서가 완성됩니다.
-                </motion.p>
-              </div>
+            {/* Hero (심플 배너) */}
+            <section className="rounded-2xl bg-gradient-to-br from-neutral-900 to-neutral-700 px-7 py-7">
+              <motion.h2 initial={{ opacity: 0, y: 12 }} animate={{ opacity: 1, y: 0 }} className="text-2xl md:text-3xl font-bold text-white mb-2 tracking-tight">혁신 사업계획서 작성 AI</motion.h2>
+              <motion.p initial={{ opacity: 0, y: 12 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.1 }} className="text-sm text-neutral-300 max-w-2xl leading-relaxed">자료를 올리면 AI가 <strong className="text-white">무엇을 써야 할지 분석</strong>해 양식을 만들고, 작성·평가·수정·내보내기까지 한 번에 완성합니다.</motion.p>
             </section>
 
-            {/* 파일 형식 안내 */}
-            <div className="mb-6 flex items-start gap-2.5 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800">
-              <Info className="mt-0.5 h-4 w-4 flex-shrink-0 text-amber-600" />
-              <p>
-                HWP·DOCX 파일은 자동으로 텍스트만 추출되어 표·이미지·서식은 반영되지 않을 수 있습니다.
-                인식 품질을 높이려면 <strong>PDF로 변환 후 업로드</strong>를 권장합니다.
+            {/* STEP 1 — 자료 업로드 */}
+            <section className="bg-white rounded-2xl border border-neutral-200 p-5">
+              <div className="flex items-center gap-2 mb-1">
+                <span className="text-[11px] font-bold text-white bg-neutral-900 rounded-md px-2 py-0.5">STEP 1</span>
+                <h3 className="font-bold text-neutral-900">자료 업로드</h3>
+              </div>
+              <p className="text-xs text-neutral-500 mb-4">‘사업계획서 양식’만 필수예요. 나머지는 올릴수록 결과가 정확해집니다.</p>
+              <div className="grid sm:grid-cols-2 gap-3">
+                <FileUploadSection title="사업계획서 양식" icon={FileText} colorClass="text-indigo-600" files={templateFiles} setFiles={setTemplateFiles} required />
+                <FileUploadSection title="모집공고 양식" icon={Briefcase} colorClass="text-blue-600" files={announcementFiles} setFiles={setAnnouncementFiles} />
+                <FileUploadSection title="사업계획서 관련 정보" icon={Info} colorClass="text-emerald-600" files={infoFiles} setFiles={setInfoFiles} />
+                <FileUploadSection title="운영 기준 항목" icon={ShieldCheck} colorClass="text-purple-600" files={criteriaFiles} setFiles={setCriteriaFiles} />
+              </div>
+              <p className="text-[11px] text-amber-700 bg-amber-50 border border-amber-100 rounded-lg px-3 py-2 mt-3 flex items-start gap-1.5">
+                <Info className="w-3.5 h-3.5 mt-0.5 shrink-0" />HWP·DOCX는 텍스트만 추출됩니다. 정확도를 위해 <strong>PDF로 변환 후 업로드</strong>를 권장합니다.
               </p>
-            </div>
+            </section>
 
-            {/* Input Section */}
-            <section className="grid md:grid-cols-2 gap-6">
-              {/* 1. 모집공고 양식 */}
-              <FileUploadSection
-                title="모집공고 양식 (선택)"
-                icon={Briefcase}
-                colorClass="text-blue-600"
-                files={announcementFiles}
-                setFiles={setAnnouncementFiles}
-              />
-
-              {/* 2. 사업계획서 양식 */}
-              <FileUploadSection
-                title="사업계획서 양식 (필수)"
-                icon={FileText}
-                colorClass="text-indigo-600"
-                files={templateFiles}
-                setFiles={setTemplateFiles}
-                required
-              />
-
-              {/* 3. 사업계획서 관련 정보 */}
-              <FileUploadSection
-                title="사업계획서 관련 정보 (선택)"
-                icon={Info}
-                colorClass="text-emerald-600"
-                files={infoFiles}
-                setFiles={setInfoFiles}
-              />
-
-              {/* 4. 운영 기준 항목 */}
-              <FileUploadSection
-                title="운영 기준 항목 (선택)"
-                icon={ShieldCheck}
-                colorClass="text-purple-600"
-                files={criteriaFiles}
-                setFiles={setCriteriaFiles}
-              />
-
-              {/* 5. 전반적인 내용 */}
-              <div className="bg-white p-6 rounded-2xl shadow-sm border border-neutral-200 flex flex-col h-full md:col-span-2">
-                <div className="flex items-center gap-2 mb-4">
-                  <PenTool className="w-5 h-5 text-rose-600" />
-                  <h3 className="font-semibold text-neutral-900">전반적인 내용 (필수)</h3>
+            {/* STEP 2 — 전반적인 내용 */}
+            <section className="bg-white rounded-2xl border border-neutral-200 p-5">
+              <div className="flex items-center justify-between mb-3 flex-wrap gap-3">
+                <div className="flex items-center gap-2">
+                  <span className="text-[11px] font-bold text-white bg-neutral-900 rounded-md px-2 py-0.5">STEP 2</span>
+                  <PenTool className="w-4 h-4 text-rose-600" />
+                  <h3 className="font-bold text-neutral-900">전반적인 내용</h3>
                 </div>
-                <textarea
-                  value={content}
-                  onChange={(e) => setContent(e.target.value)}
-                  placeholder="사업의 배경, 해결하고자 하는 문제, 우리만의 솔루션, 수익 모델 등 작성하고자 하는 내용을 자유롭게 적어주세요."
-                  className="w-full flex-grow min-h-[160px] p-3 bg-neutral-50 border border-neutral-200 rounded-xl focus:ring-2 focus:ring-rose-500 focus:border-transparent outline-none resize-none text-sm"
+                <div className="flex bg-neutral-100 p-1 rounded-lg">
+                  <button onClick={() => setInputMode('analyze')} className={`flex items-center gap-1 px-3 py-1.5 rounded-md text-xs font-semibold transition-all ${inputMode === 'analyze' ? 'bg-white text-rose-600 shadow-sm' : 'text-neutral-500'}`}><Sparkles className="w-3.5 h-3.5" />AI 분석</button>
+                  <button onClick={() => setInputMode('simple')} className={`px-3 py-1.5 rounded-md text-xs font-semibold transition-all ${inputMode === 'simple' ? 'bg-white text-rose-600 shadow-sm' : 'text-neutral-500'}`}>직접 입력</button>
+                </div>
+              </div>
+              {inputMode === 'analyze' ? (
+                <ContentAnalyzer
+                  seed={analyzeSeed} setSeed={setAnalyzeSeed}
+                  analysis={contentAnalysis} fields={contentFields}
+                  answers={contentAnswers} setAnswers={setContentAnswers}
+                  isAnalyzing={isAnalyzing} hasTemplate={templateFiles.length > 0}
+                  onAnalyze={handleAnalyze}
                 />
-              </div>
+              ) : (
+                <textarea value={content} onChange={(e) => setContent(e.target.value)} placeholder="사업의 배경, 해결하고자 하는 문제, 우리만의 솔루션, 수익 모델 등 작성하고자 하는 내용을 자유롭게 적어주세요." className="w-full min-h-[160px] p-3 bg-neutral-50 border border-neutral-200 rounded-xl focus:ring-2 focus:ring-rose-500 focus:border-transparent outline-none resize-none text-sm" />
+              )}
             </section>
 
-            <section className="flex flex-col sm:flex-row items-center justify-between gap-4 bg-white p-4 rounded-2xl border border-neutral-200 shadow-sm">
-              <div className="flex items-center gap-3">
-                <div className="p-2 bg-indigo-50 rounded-lg">
-                  <Briefcase className="w-5 h-5 text-indigo-600" />
-                </div>
-                <div>
-                  <p className="text-sm font-bold text-neutral-900">AI 모델 선택</p>
-                  <p className="text-xs text-neutral-500">Pro는 고품질, Flash는 빠른 속도와 높은 할당량</p>
-                </div>
-              </div>
-              <div className="flex bg-neutral-100 p-1 rounded-xl w-full sm:w-auto">
-                <button
-                  onClick={() => setSelectedModel('gemini-3.1-pro-preview')}
-                  className={`flex-1 sm:flex-none px-4 py-2 rounded-lg text-sm font-semibold transition-all ${
-                    selectedModel === 'gemini-3.1-pro-preview' 
-                    ? 'bg-white text-indigo-600 shadow-sm' 
-                    : 'text-neutral-500 hover:text-neutral-700'
-                  }`}
-                >
-                  Pro (권장)
-                </button>
-                <button
-                  onClick={() => setSelectedModel('gemini-3-flash-preview')}
-                  className={`flex-1 sm:flex-none px-4 py-2 rounded-lg text-sm font-semibold transition-all ${
-                    selectedModel === 'gemini-3-flash-preview' 
-                    ? 'bg-white text-indigo-600 shadow-sm' 
-                    : 'text-neutral-500 hover:text-neutral-700'
-                  }`}
-                >
-                  Flash (빠름)
-                </button>
-              </div>
-            </section>
-
-            <section>
-              <button
-                onClick={handleGenerate}
-                disabled={isGenerating}
-                className="w-full py-4 bg-neutral-900 hover:bg-neutral-800 text-white rounded-2xl font-bold text-lg flex items-center justify-center gap-2 transition-all disabled:opacity-70 disabled:cursor-not-allowed shadow-md"
-              >
-                <Send className="w-6 h-6" />
-                고득점 사업계획서 생성하기
+            {/* STEP 3 — 생성 */}
+            <section className="bg-white rounded-2xl border border-neutral-200 p-5">
+              <button onClick={handleGenerate} className="w-full py-3.5 bg-neutral-900 hover:bg-neutral-800 text-white rounded-xl font-bold text-base flex items-center justify-center gap-2 transition-all">
+                <Send className="w-5 h-5" />
+                사업계획서 완성하기
               </button>
               {error && <p className="text-red-500 text-sm text-center font-medium mt-3">{error}</p>}
             </section>
@@ -695,150 +469,100 @@ export default function App() {
         )}
 
         {currentView === 'generating' && (
-          <div className="flex flex-col items-center justify-center min-h-[60vh] space-y-8">
-            <motion.div
-              initial={{ opacity: 0, scale: 0.9 }}
-              animate={{ opacity: 1, scale: 1 }}
-              className="flex flex-col items-center w-full max-w-md"
-            >
-              <Loader2 className="w-16 h-16 text-blue-600 animate-spin mb-6" />
-              <h2 className="text-3xl font-bold text-neutral-900 mb-2">고득점 사업계획서 생성 중...</h2>
-              <p className="text-neutral-500 mb-8 text-center">AI가 제공된 양식과 정보를 분석하여<br/>최적의 내용을 작성하고 있습니다.</p>
-              
-              <div className="w-full bg-neutral-200 rounded-full h-4 overflow-hidden">
-                <motion.div 
-                  className="bg-blue-600 h-full rounded-full"
-                  initial={{ width: 0 }}
-                  animate={{ width: `${progress}%` }}
-                  transition={{ ease: "linear", duration: 0.5 }}
-                />
-              </div>
-              <p className="text-blue-600 font-bold mt-4 text-xl">{Math.round(progress)}%</p>
-            </motion.div>
+          <div className="flex flex-col items-center min-h-[60vh] space-y-6 pt-6">
+            <div className="flex flex-col items-center">
+              <Loader2 className="w-12 h-12 text-blue-600 animate-spin mb-4" />
+              <h2 className="text-2xl font-bold text-neutral-900 mb-1">고득점 사업계획서 {genLabel} 중...</h2>
+              <p className="text-neutral-500 text-center text-sm">AI가 실시간으로 작성하고 있습니다. 잠시만 기다려주세요.</p>
+            </div>
+            <div ref={streamRef} className="w-full max-w-3xl h-[50vh] overflow-y-auto bg-white border border-neutral-200 rounded-2xl p-6 text-sm text-neutral-700 whitespace-pre-wrap leading-relaxed shadow-sm">
+              {streamingText || '...'}
+            </div>
           </div>
         )}
 
         {currentView === 'result' && result && (
-          <motion.section
-            initial={{ opacity: 0, y: 20 }}
-            animate={{ opacity: 1, y: 0 }}
-            className="bg-white p-8 md:p-12 rounded-3xl shadow-lg border border-neutral-200"
-          >
-            <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 mb-8 border-b pb-4">
-              <div className="flex items-center gap-4">
-                <button 
-                  onClick={() => setCurrentView('input')}
-                  className="p-2 hover:bg-neutral-100 rounded-full transition-colors"
-                  title="다시 작성하기"
-                >
-                  <X className="w-6 h-6 text-neutral-500" />
-                </button>
-                <h3 className="text-2xl font-bold text-neutral-900">생성된 사업계획서</h3>
+          <motion.section initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} className="space-y-6">
+            {/* 결과 헤더 + 액션 */}
+            <div className="bg-white p-5 rounded-2xl shadow-sm border border-neutral-200 flex flex-col lg:flex-row lg:items-center justify-between gap-4">
+              <div className="flex items-center gap-3">
+                <button onClick={() => setCurrentView('input')} className="p-2 hover:bg-neutral-100 rounded-full transition-colors" title="입력으로 돌아가기"><X className="w-5 h-5 text-neutral-500" /></button>
+                <h3 className="text-xl font-bold text-neutral-900">생성된 사업계획서</h3>
               </div>
-              <div className="flex items-center gap-2">
-                <button
-                  onClick={handleCopy}
-                  className="flex items-center gap-2 px-4 py-2 rounded-xl bg-neutral-100 hover:bg-neutral-200 text-neutral-700 font-medium text-sm transition-colors"
-                >
-                  {isCopied ? <Check className="w-4 h-4 text-emerald-600" /> : <Copy className="w-4 h-4" />}
-                  {isCopied ? '복사됨' : '복사'}
+              <div className="flex items-center gap-2 flex-wrap">
+                <button onClick={handleSaveProject} className="flex items-center gap-2 px-3 py-2 rounded-xl bg-neutral-100 hover:bg-neutral-200 text-neutral-700 font-medium text-sm transition-colors">
+                  {justSaved ? <Check className="w-4 h-4 text-emerald-600" /> : <Save className="w-4 h-4" />}{justSaved ? '저장됨' : '저장'}
                 </button>
-                <button
-                  onClick={handleDownloadWord}
-                  className="flex items-center gap-2 px-4 py-2 rounded-xl bg-blue-600 hover:bg-blue-700 text-white font-medium text-sm transition-colors"
-                >
-                  <Download className="w-4 h-4" />
-                  Word 다운로드
+                <button onClick={handleCopy} className="flex items-center gap-2 px-3 py-2 rounded-xl bg-neutral-100 hover:bg-neutral-200 text-neutral-700 font-medium text-sm transition-colors">
+                  {isCopied ? <Check className="w-4 h-4 text-emerald-600" /> : <Copy className="w-4 h-4" />}{isCopied ? '복사됨' : '복사'}
                 </button>
-                <a
-                  href="https://docs.google.com/"
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="flex items-center gap-2 px-4 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white font-medium text-sm transition-colors"
-                >
-                  <ExternalLink className="w-4 h-4" />
-                  Docs 바로가기
-                </a>
+                <button onClick={() => downloadDocx(result)} className="flex items-center gap-2 px-3 py-2 rounded-xl bg-blue-600 hover:bg-blue-700 text-white font-medium text-sm transition-colors"><FileType2 className="w-4 h-4" />Word(.docx)</button>
+                <button onClick={() => downloadWordHtml(result)} className="flex items-center gap-2 px-3 py-2 rounded-xl bg-neutral-100 hover:bg-neutral-200 text-neutral-700 font-medium text-sm transition-colors"><Download className="w-4 h-4" />.doc</button>
+                <button onClick={() => exportPdf(result)} className="flex items-center gap-2 px-3 py-2 rounded-xl bg-rose-600 hover:bg-rose-700 text-white font-medium text-sm transition-colors"><Printer className="w-4 h-4" />PDF</button>
+                <a href="https://docs.google.com/" target="_blank" rel="noopener noreferrer" className="flex items-center gap-2 px-3 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white font-medium text-sm transition-colors"><ExternalLink className="w-4 h-4" />Docs</a>
               </div>
             </div>
-            <div ref={resultRef} className="prose prose-neutral max-w-none prose-headings:font-bold prose-h1:text-3xl prose-h2:text-2xl prose-h3:text-xl prose-p:text-neutral-700 prose-li:text-neutral-700 prose-table:border-collapse prose-table:w-full prose-th:border prose-th:border-neutral-300 prose-th:bg-neutral-100 prose-th:p-3 prose-td:border prose-td:border-neutral-300 prose-td:p-3">
-              <ReactMarkdown remarkPlugins={[remarkGfm]} rehypePlugins={[rehypeRaw]}>{result}</ReactMarkdown>
-            </div>
-          </motion.section>
-        )}
 
-        {currentView === 'guide' && (
-          <motion.section
-            initial={{ opacity: 0, y: 20 }}
-            animate={{ opacity: 1, y: 0 }}
-            className="bg-white p-8 md:p-12 rounded-3xl shadow-sm border border-neutral-200"
-          >
-            <div className="max-w-3xl mx-auto">
-              <h2 className="text-3xl font-bold text-neutral-900 mb-8">혁신 사업계획서 작성 AI 사용방법</h2>
-              
-              <div className="space-y-10">
-                {/* Step 1 */}
-                <div className="flex gap-4">
-                  <div className="flex-shrink-0 w-10 h-10 rounded-full bg-indigo-100 flex items-center justify-center text-indigo-600 font-bold text-lg">1</div>
-                  <div>
-                    <h3 className="text-xl font-bold text-neutral-900 mb-2">API Key 설정</h3>
-                    <p className="text-neutral-600 leading-relaxed mb-3">
-                      우측 상단의 <strong>API Key</strong> 버튼을 클릭하여 Google Gemini API Key를 입력합니다. API Key는 브라우저 로컬 환경에만 안전하게 저장되며 외부로 전송되지 않습니다.
-                    </p>
-                    <div className="bg-neutral-50 p-4 rounded-xl text-sm text-neutral-500 border border-neutral-200">
-                      💡 <strong>Tip:</strong> API Key가 없다면 <a href="https://aistudio.google.com/app/apikey" target="_blank" rel="noreferrer" className="text-blue-600 hover:underline">Google AI Studio</a>에서 무료로 발급받을 수 있습니다.
-                    </div>
+            <div className="grid lg:grid-cols-3 gap-6 items-start">
+              {/* 본문(섹션별) */}
+              <div className="lg:col-span-2 bg-white p-6 md:p-10 rounded-3xl shadow-sm border border-neutral-200 space-y-2">
+                <p className="text-xs text-neutral-400 mb-4 flex items-center gap-1.5"><ListChecks className="w-3.5 h-3.5" />각 섹션 위에 마우스를 올리면 편집·다시쓰기 버튼이 나타납니다.</p>
+                {sections.map((s, idx) => (
+                  <div key={s.id} className="group relative rounded-xl -mx-2 px-2 py-1 hover:bg-neutral-50/80 transition-colors">
+                    {busySectionId === s.id && (
+                      <div className="absolute inset-0 z-10 flex items-center justify-center bg-white/70 rounded-xl">
+                        <Loader2 className="w-6 h-6 text-blue-600 animate-spin" />
+                      </div>
+                    )}
+                    {editingId === s.id ? (
+                      <div className="space-y-2 py-2">
+                        <textarea value={editBuffer} onChange={(e) => setEditBuffer(e.target.value)} className="w-full min-h-[200px] p-3 bg-neutral-50 border border-neutral-300 rounded-xl outline-none focus:ring-2 focus:ring-indigo-500 text-sm font-mono" />
+                        <div className="flex gap-2">
+                          <button onClick={saveEdit} className="px-3 py-1.5 rounded-lg bg-indigo-600 text-white text-sm font-semibold hover:bg-indigo-700">저장</button>
+                          <button onClick={() => { setEditingId(null); setEditBuffer(''); }} className="px-3 py-1.5 rounded-lg bg-neutral-100 text-neutral-600 text-sm font-semibold hover:bg-neutral-200">취소</button>
+                        </div>
+                      </div>
+                    ) : (
+                      <>
+                        <div className="prose prose-neutral max-w-none prose-headings:font-bold prose-h1:text-2xl prose-h2:text-xl prose-h3:text-lg prose-p:text-neutral-700 prose-li:text-neutral-700 prose-table:border-collapse prose-table:w-full prose-th:border prose-th:border-neutral-300 prose-th:bg-neutral-100 prose-th:p-3 prose-td:border prose-td:border-neutral-300 prose-td:p-3">
+                          <ReactMarkdown remarkPlugins={[remarkGfm]} rehypePlugins={[rehypeRaw]}>{sectionToMarkdown(s)}</ReactMarkdown>
+                        </div>
+                        <div className="absolute right-2 top-2 opacity-0 group-hover:opacity-100 transition-opacity flex gap-1">
+                          <button onClick={() => startEdit(s.id, sectionToMarkdown(s))} className="flex items-center gap-1 px-2 py-1 rounded-lg bg-white border border-neutral-200 shadow-sm text-xs font-medium text-neutral-600 hover:bg-neutral-50" title="직접 편집"><Pencil className="w-3 h-3" />편집</button>
+                          <button onClick={() => { setRegenForId(regenForId === s.id ? null : s.id); setRegenText(''); }} className="flex items-center gap-1 px-2 py-1 rounded-lg bg-white border border-neutral-200 shadow-sm text-xs font-medium text-indigo-600 hover:bg-indigo-50" title="AI로 다시쓰기"><RefreshCw className="w-3 h-3" />다시쓰기</button>
+                        </div>
+                        {regenForId === s.id && (
+                          <div className="mt-2 flex flex-col sm:flex-row gap-2 bg-indigo-50 border border-indigo-100 rounded-xl p-2">
+                            <input value={regenText} onChange={(e) => setRegenText(e.target.value)} onKeyDown={(e) => { if (e.key === 'Enter') runRegenerate(s.id, regenText); }} placeholder="예: 표로 정리하고 정량 목표(KPI)를 추가해줘 (비우면 자동 보강)" className="flex-1 px-3 py-2 rounded-lg border border-indigo-200 outline-none focus:ring-2 focus:ring-indigo-400 text-sm" />
+                            <button onClick={() => runRegenerate(s.id, regenText)} className="px-3 py-2 rounded-lg bg-indigo-600 text-white text-sm font-semibold hover:bg-indigo-700 whitespace-nowrap">다시쓰기 실행</button>
+                          </div>
+                        )}
+                      </>
+                    )}
                   </div>
-                </div>
+                ))}
+                {error && <p className="text-red-500 text-sm font-medium mt-3">{error}</p>}
+              </div>
 
-                {/* Step 2 */}
-                <div className="flex gap-4">
-                  <div className="flex-shrink-0 w-10 h-10 rounded-full bg-blue-100 flex items-center justify-center text-blue-600 font-bold text-lg">2</div>
-                  <div>
-                    <h3 className="text-xl font-bold text-neutral-900 mb-2">양식 업로드 (모집공고 및 사업계획서)</h3>
-                    <p className="text-neutral-600 leading-relaxed">
-                      지원하고자 하는 사업의 <strong>모집공고 양식(선택)</strong>과 <strong>사업계획서 양식(필수)</strong>을 업로드합니다. PDF, DOCX, HWP 파일을 지원하며, 텍스트로 직접 복사하여 붙여넣을 수도 있습니다.
-                    </p>
-                    <ul className="list-disc list-inside mt-2 text-sm text-neutral-500 space-y-1">
-                      <li>모집공고를 첨부하면 AI가 평가 기준을 분석하여 맞춤형으로 작성합니다.</li>
-                      <li>HWP 파일은 인식률을 높이기 위해 가급적 PDF로 변환 후 업로드하는 것을 권장합니다.</li>
-                    </ul>
-                  </div>
-                </div>
+              {/* 사이드: 평가 + 대화형 보완 */}
+              <div className="space-y-6 lg:sticky lg:top-24">
+                <EvaluationPanel evaluation={evaluation} isEvaluating={isEvaluating} onEvaluate={handleEvaluate} onReinforce={handleReinforce} />
 
-                {/* Step 3 */}
-                <div className="flex gap-4">
-                  <div className="flex-shrink-0 w-10 h-10 rounded-full bg-emerald-100 flex items-center justify-center text-emerald-600 font-bold text-lg">3</div>
-                  <div>
-                    <h3 className="text-xl font-bold text-neutral-900 mb-2">사업 정보 및 전반적인 내용 입력</h3>
-                    <p className="text-neutral-600 leading-relaxed">
-                      <strong>사업계획서 관련 정보</strong>에 타겟 고객, 시장 상황, 지원 사업명 등을 간략히 적어주세요. <strong>전반적인 내용</strong>에는 아이템의 핵심 기능, 수익 모델, 차별성 등을 자유롭게 작성합니다.
-                    </p>
-                    <div className="bg-emerald-50 p-4 rounded-xl text-sm text-emerald-700 border border-emerald-100 mt-3">
-                      ✨ <strong>AI 자동 확장 기능:</strong> 입력해주신 정보를 바탕으로 AI가 스스로 분석하여, 기존 양식에 없는 <strong>새로운 필수 항목(목차)을 추가로 기획</strong>하여 더욱 완벽한 사업계획서를 만들어냅니다.
-                    </div>
+                <div className="bg-white rounded-2xl border border-neutral-200 shadow-sm p-6">
+                  <div className="flex items-center gap-2 mb-3">
+                    <MessageSquarePlus className="w-5 h-5 text-rose-600" />
+                    <h3 className="font-bold text-neutral-900">대화형 보완</h3>
                   </div>
-                </div>
-
-                {/* Step 4 */}
-                <div className="flex gap-4">
-                  <div className="flex-shrink-0 w-10 h-10 rounded-full bg-rose-100 flex items-center justify-center text-rose-600 font-bold text-lg">4</div>
-                  <div>
-                    <h3 className="text-xl font-bold text-neutral-900 mb-2">생성 및 결과 활용</h3>
-                    <p className="text-neutral-600 leading-relaxed">
-                      <strong>고득점 사업계획서 생성하기</strong> 버튼을 누르면 AI가 작성을 시작합니다. 완료된 사업계획서는 마크다운 형태로 제공되며, 강조 색상과 표가 깔끔하게 적용되어 있습니다.
-                    </p>
-                    <ul className="list-disc list-inside mt-2 text-sm text-neutral-500 space-y-1">
-                      <li><strong>복사:</strong> 화면에 보이는 서식·색상·표 그대로 클립보드에 복사되어, Google Docs·워드 등에 붙여넣으면 동일하게 재현됩니다.</li>
-                      <li><strong>Word 다운로드:</strong> 작성된 내용을 .doc 형식의 워드 파일로 즉시 다운로드할 수 있습니다.</li>
-                      <li><strong>Docs 바로가기:</strong> Google Docs를 새 탭으로 열어 복사한 내용을 바로 붙여넣을 수 있습니다.</li>
-                    </ul>
-                  </div>
+                  <p className="text-xs text-neutral-500 mb-3 leading-relaxed">요청을 입력하면 전체 사업계획서를 그에 맞게 다시 다듬습니다. (예: "전체적으로 더 정량적으로", "리스크 대응 방안 항목 추가")</p>
+                  <textarea value={refineInput} onChange={(e) => setRefineInput(e.target.value)} placeholder="수정 요청을 입력하세요..." className="w-full min-h-[80px] p-3 bg-neutral-50 border border-neutral-200 rounded-xl outline-none focus:ring-2 focus:ring-rose-500 text-sm resize-none mb-2" />
+                  <button onClick={handleRefine} disabled={!refineInput.trim()} className="w-full flex items-center justify-center gap-2 px-3 py-2.5 rounded-xl bg-neutral-900 hover:bg-neutral-800 disabled:opacity-50 text-white text-sm font-semibold transition-colors"><Send className="w-4 h-4" />요청 반영하기</button>
                 </div>
               </div>
             </div>
           </motion.section>
         )}
+
+        {currentView === 'guide' && <GuideView />}
       </main>
 
       {/* Footer */}
@@ -849,25 +573,40 @@ export default function App() {
         </div>
       </footer>
 
-      {/* Patch Notes Modal */}
+      {/* 프로젝트 드로어 */}
+      {isProjectsOpen && (
+        <div className="fixed inset-0 z-[100] flex justify-end bg-black/40 backdrop-blur-sm" onClick={() => setIsProjectsOpen(false)}>
+          <motion.div initial={{ x: 400 }} animate={{ x: 0 }} className="bg-white w-full max-w-md h-full shadow-2xl flex flex-col" onClick={(e) => e.stopPropagation()}>
+            <div className="p-6 border-b border-neutral-100 flex justify-between items-center">
+              <div className="flex items-center gap-2"><FolderOpen className="w-5 h-5 text-indigo-600" /><h3 className="text-lg font-bold text-neutral-900">내 사업계획서</h3></div>
+              <button onClick={() => setIsProjectsOpen(false)} className="p-2 hover:bg-neutral-100 rounded-full"><X className="w-5 h-5 text-neutral-500" /></button>
+            </div>
+            <div className="flex-1 overflow-y-auto p-4 space-y-3">
+              {projects.length === 0 && <p className="text-sm text-neutral-400 text-center py-12">저장된 사업계획서가 없습니다.<br />결과 화면에서 '저장'을 누르면 여기에 보관됩니다.</p>}
+              {projects.map(p => (
+                <div key={p.id} className="border border-neutral-200 rounded-xl p-4 hover:border-indigo-300 transition-colors">
+                  <div className="flex items-start justify-between gap-2">
+                    <div className="min-w-0">
+                      <p className="font-semibold text-neutral-900 truncate">{p.name}</p>
+                      <p className="text-xs text-neutral-400 mt-0.5">{new Date(p.updatedAt).toLocaleString('ko-KR')}</p>
+                    </div>
+                    <button onClick={() => handleDeleteProject(p.id)} className="p-1.5 text-neutral-400 hover:text-rose-500 rounded-lg hover:bg-rose-50 shrink-0"><Trash2 className="w-4 h-4" /></button>
+                  </div>
+                  <button onClick={() => handleLoadProject(p)} className="mt-3 w-full py-2 rounded-lg bg-indigo-50 text-indigo-700 text-sm font-semibold hover:bg-indigo-100 transition-colors">불러오기</button>
+                </div>
+              ))}
+            </div>
+          </motion.div>
+        </div>
+      )}
+
+      {/* 패치노트 모달 */}
       {isPatchNotesOpen && (
         <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/50 backdrop-blur-sm p-4">
-          <motion.div
-            initial={{ opacity: 0, scale: 0.95 }}
-            animate={{ opacity: 1, scale: 1 }}
-            className="bg-white rounded-2xl shadow-2xl w-full max-w-lg overflow-hidden flex flex-col max-h-[80vh]"
-          >
+          <motion.div initial={{ opacity: 0, scale: 0.95 }} animate={{ opacity: 1, scale: 1 }} className="bg-white rounded-2xl shadow-2xl w-full max-w-lg overflow-hidden flex flex-col max-h-[80vh]">
             <div className="p-6 border-b border-neutral-100 flex justify-between items-center">
-              <div>
-                <h3 className="text-xl font-bold text-neutral-900">패치노트</h3>
-                <p className="text-sm text-neutral-500 mt-0.5">업데이트 내역 및 히스토리</p>
-              </div>
-              <button 
-                onClick={() => setIsPatchNotesOpen(false)}
-                className="p-2 hover:bg-neutral-100 rounded-full transition-colors"
-              >
-                <X className="w-5 h-5 text-neutral-500" />
-              </button>
+              <div><h3 className="text-xl font-bold text-neutral-900">패치노트</h3><p className="text-sm text-neutral-500 mt-0.5">업데이트 내역 및 히스토리</p></div>
+              <button onClick={() => setIsPatchNotesOpen(false)} className="p-2 hover:bg-neutral-100 rounded-full transition-colors"><X className="w-5 h-5 text-neutral-500" /></button>
             </div>
             <div className="p-6 overflow-y-auto space-y-8">
               {patchNotes.map((note, i) => (
@@ -879,68 +618,35 @@ export default function App() {
                   </div>
                   <ul className="space-y-1.5">
                     {note.details.map((detail, j) => (
-                      <li key={j} className="text-sm text-neutral-600 flex items-start gap-2">
-                        <span className="mt-1.5 w-1 h-1 rounded-full bg-neutral-400 shrink-0" />
-                        {detail}
-                      </li>
+                      <li key={j} className="text-sm text-neutral-600 flex items-start gap-2"><span className="mt-1.5 w-1 h-1 rounded-full bg-neutral-400 shrink-0" />{detail}</li>
                     ))}
                   </ul>
                 </div>
               ))}
             </div>
-            <div className="p-4 bg-neutral-50 border-t border-neutral-100 text-center">
-              <p className="text-xs text-neutral-400">더 나은 서비스를 위해 꾸준히 업데이트 중입니다.</p>
-            </div>
+            <div className="p-4 bg-neutral-50 border-t border-neutral-100 text-center"><p className="text-xs text-neutral-400">더 나은 서비스를 위해 꾸준히 업데이트 중입니다.</p></div>
           </motion.div>
         </div>
       )}
 
-      {/* API Key Modal */}
+      {/* API Key 모달 */}
       {isKeyModalOpen && (
         <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/50 backdrop-blur-sm p-4">
-          <motion.div
-            initial={{ opacity: 0, scale: 0.95 }}
-            animate={{ opacity: 1, scale: 1 }}
-            className="bg-white rounded-2xl shadow-2xl w-full max-w-md overflow-hidden"
-          >
+          <motion.div initial={{ opacity: 0, scale: 0.95 }} animate={{ opacity: 1, scale: 1 }} className="bg-white rounded-2xl shadow-2xl w-full max-w-md overflow-hidden">
             <div className="p-6 border-b border-neutral-100">
               <h3 className="text-xl font-bold text-neutral-900">Google API Key 설정</h3>
-              <p className="text-sm text-neutral-500 mt-1">
-                Gemini API를 사용하기 위해 API Key를 입력해주세요. 키는 브라우저에만 안전하게 저장됩니다.
-              </p>
+              <p className="text-sm text-neutral-500 mt-1">Gemini API를 사용하기 위해 API Key를 입력해주세요. 키는 브라우저에만 안전하게 저장됩니다.</p>
             </div>
             <div className="p-6 space-y-4">
               <div>
                 <label className="block text-sm font-medium text-neutral-700 mb-1">API Key</label>
                 <div className="relative">
-                  <input
-                    type={showKey ? 'text' : 'password'}
-                    value={tempKey}
-                    onChange={(e) => setTempKey(e.target.value)}
-                    onKeyDown={(e) => { if (e.key === 'Enter' && tempKey.trim()) handleSaveKey(); }}
-                    placeholder="AIzaSy..."
-                    autoComplete="off"
-                    spellCheck={false}
-                    className="w-full p-3 pr-12 bg-neutral-50 border border-neutral-200 rounded-xl focus:ring-2 focus:ring-indigo-500 focus:border-transparent font-mono text-sm"
-                  />
-                  <button
-                    type="button"
-                    onClick={() => setShowKey((v) => !v)}
-                    aria-label={showKey ? 'API Key 숨기기' : 'API Key 표시'}
-                    title={showKey ? '숨기기' : '표시'}
-                    className="absolute right-2 top-1/2 -translate-y-1/2 p-2 text-neutral-400 hover:text-neutral-700 rounded-lg hover:bg-neutral-200/60 transition-colors"
-                  >
-                    {showKey ? <EyeOff className="w-5 h-5" /> : <Eye className="w-5 h-5" />}
-                  </button>
+                  <input type={showKey ? 'text' : 'password'} value={tempKey} onChange={(e) => setTempKey(e.target.value)} onKeyDown={(e) => { if (e.key === 'Enter' && tempKey.trim()) handleSaveKey(); }} placeholder="AIzaSy..." autoComplete="off" spellCheck={false} className="w-full p-3 pr-12 bg-neutral-50 border border-neutral-200 rounded-xl focus:ring-2 focus:ring-indigo-500 focus:border-transparent font-mono text-sm" />
+                  <button type="button" onClick={() => setShowKey(v => !v)} aria-label={showKey ? 'API Key 숨기기' : 'API Key 표시'} className="absolute right-2 top-1/2 -translate-y-1/2 p-2 text-neutral-400 hover:text-neutral-700 rounded-lg hover:bg-neutral-200/60 transition-colors">{showKey ? <EyeOff className="w-5 h-5" /> : <Eye className="w-5 h-5" />}</button>
                 </div>
               </div>
-
-              {/* 주의사항 */}
               <div className="rounded-xl border border-amber-200 bg-amber-50 p-4">
-                <div className="flex items-center gap-2 mb-2">
-                  <AlertTriangle className="w-4 h-4 text-amber-600 flex-shrink-0" />
-                  <span className="text-sm font-semibold text-amber-800">API Key 오류 방지 체크리스트</span>
-                </div>
+                <div className="flex items-center gap-2 mb-2"><AlertTriangle className="w-4 h-4 text-amber-600 flex-shrink-0" /><span className="text-sm font-semibold text-amber-800">API Key 오류 방지 체크리스트</span></div>
                 <ul className="space-y-1.5 text-xs text-amber-800 leading-relaxed list-disc pl-5">
                   <li><strong>Gemini API Key</strong>가 맞는지 확인하세요. (<code className="px-1 bg-amber-100 rounded">AIzaSy</code>로 시작)</li>
                   <li>키 <strong>앞뒤 공백·줄바꿈</strong>이 섞이지 않도록 정확히 복사하세요. (저장 시 자동 정리됩니다)</li>
@@ -948,34 +654,48 @@ export default function App() {
                   <li><strong>사용량 한도(429)</strong> 초과 시 잠시 후 재시도하거나 유료 플랜을 설정하세요.</li>
                   <li>키는 <strong>브라우저(로컬)에만 저장</strong>되며 외부로 전송되지 않습니다.</li>
                 </ul>
-                <a
-                  href="https://aistudio.google.com/app/apikey"
-                  target="_blank"
-                  rel="noreferrer"
-                  className="inline-flex items-center gap-1 mt-3 text-xs font-semibold text-blue-600 hover:underline"
-                >
-                  Google AI Studio에서 API Key 발급/확인
-                  <ExternalLink className="w-3 h-3" />
-                </a>
+                <a href="https://aistudio.google.com/app/apikey" target="_blank" rel="noreferrer" className="inline-flex items-center gap-1 mt-3 text-xs font-semibold text-blue-600 hover:underline">Google AI Studio에서 API Key 발급/확인<ExternalLink className="w-3 h-3" /></a>
               </div>
             </div>
             <div className="p-6 bg-neutral-50 border-t border-neutral-100 flex justify-end gap-3">
-              <button
-                onClick={() => setIsKeyModalOpen(false)}
-                className="px-4 py-2 text-neutral-600 font-medium hover:bg-neutral-200 rounded-xl transition-colors"
-              >
-                취소
-              </button>
-              <button
-                onClick={handleSaveKey}
-                className="px-4 py-2 bg-neutral-900 text-white font-medium hover:bg-neutral-800 rounded-xl transition-colors"
-              >
-                저장하기
-              </button>
+              <button onClick={() => setIsKeyModalOpen(false)} className="px-4 py-2 text-neutral-600 font-medium hover:bg-neutral-200 rounded-xl transition-colors">취소</button>
+              <button onClick={handleSaveKey} className="px-4 py-2 bg-neutral-900 text-white font-medium hover:bg-neutral-800 rounded-xl transition-colors">저장하기</button>
             </div>
           </motion.div>
         </div>
       )}
     </div>
+  );
+}
+
+function GuideView() {
+  const steps = [
+    { n: 1, color: 'indigo', title: 'API Key 설정', body: '우측 상단의 API Key 버튼을 눌러 Google Gemini API Key를 입력합니다. 키는 브라우저 로컬에만 저장됩니다.' },
+    { n: 2, color: 'blue', title: '양식 업로드 + 내용 입력', body: '모집공고(선택)·사업계획서 양식(필수)을 올립니다. 무엇을 쓸지 막막하면 AI 인터뷰를 켜고 질문에 답만 하세요 — 나머지는 AI가 채웁니다. (단계별·직접 입력도 가능)' },
+    { n: 3, color: 'emerald', title: '생성 → 평가 → 보강', body: '생성된 초안을 AI 평가위원에게 채점받고, 약한 섹션은 버튼 한 번으로 보강하거나 섹션별 다시쓰기로 다듬습니다.' },
+    { n: 4, color: 'rose', title: '편집 → 저장 → 내보내기', body: '섹션을 직접 편집하고, 프로젝트로 저장한 뒤 Word(.docx)·PDF·복사로 최종 결과물을 내보냅니다.' },
+  ];
+  const colorMap: Record<string, string> = {
+    indigo: 'bg-indigo-100 text-indigo-600', blue: 'bg-blue-100 text-blue-600',
+    emerald: 'bg-emerald-100 text-emerald-600', rose: 'bg-rose-100 text-rose-600',
+  };
+  return (
+    <motion.section initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} className="bg-white p-8 md:p-12 rounded-3xl shadow-sm border border-neutral-200">
+      <div className="max-w-3xl mx-auto">
+        <h2 className="text-3xl font-bold text-neutral-900 mb-8">사용방법</h2>
+        <div className="space-y-8">
+          {steps.map(s => (
+            <div key={s.n} className="flex gap-4">
+              <div className={`flex-shrink-0 w-10 h-10 rounded-full flex items-center justify-center font-bold text-lg ${colorMap[s.color]}`}>{s.n}</div>
+              <div>
+                <h3 className="text-xl font-bold text-neutral-900 mb-1.5">{s.title}</h3>
+                <p className="text-neutral-600 leading-relaxed">{s.body}</p>
+              </div>
+            </div>
+          ))}
+        </div>
+        <div className="bg-emerald-50 p-4 rounded-xl text-sm text-emerald-700 border border-emerald-100 mt-8">✨ <strong>AI 자동 확장:</strong> 입력 정보를 분석해 기존 양식에 없는 필수 항목(목차)을 스스로 추가 기획하여 더 완성도 높은 사업계획서를 만들어냅니다.</div>
+      </div>
+    </motion.section>
   );
 }
