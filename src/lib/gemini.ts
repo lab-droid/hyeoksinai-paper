@@ -1,6 +1,6 @@
 // Gemini 호출 로직 모음: 전체 생성(스트리밍), 자가 평가, 섹션 재생성, 대화형 보완.
 
-import { GoogleGenAI } from '@google/genai';
+import { GoogleGenAI, Type } from '@google/genai';
 import { fileToPart } from './files';
 
 export type ModelId = 'gemini-3.1-pro-preview' | 'gemini-3-flash-preview';
@@ -86,6 +86,57 @@ export const normalizeBold = (text: string): string =>
 const stripCodeFence = (text: string): string =>
   text.replace(/^```(?:json|markdown|md)?\s*/i, '').replace(/```\s*$/i, '').trim();
 
+// 모델이 돌려준 텍스트에서 JSON을 최대한 견고하게 파싱한다.
+// 1) 그대로 파싱 → 2) 첫 '{' ~ 마지막 '}'만 잘라 파싱 → 3) 흔한 깨짐(끝의 콤마, 잘림)을 보정해 재시도.
+const parseJsonLoose = <T>(text: string): T => {
+  const raw = stripCodeFence(text);
+  const candidates: string[] = [raw];
+
+  const start = raw.indexOf('{');
+  const end = raw.lastIndexOf('}');
+  if (start !== -1 && end !== -1 && end > start) candidates.push(raw.slice(start, end + 1));
+
+  for (const c of candidates) {
+    try { return JSON.parse(c) as T; } catch { /* 다음 후보 시도 */ }
+  }
+
+  // 마지막 시도: 잘린 응답 복구 — 따옴표/괄호 균형을 맞춰 닫는다.
+  const base = start !== -1 ? raw.slice(start) : raw;
+  const repaired = repairTruncatedJson(base);
+  if (repaired) {
+    try { return JSON.parse(repaired) as T; } catch { /* 실패 */ }
+  }
+  throw new Error('AI 응답(JSON)을 해석하지 못했습니다. 다시 시도해주세요.');
+};
+
+// 토큰 한도 등으로 중간에 잘린 JSON을, 열린 문자열/배열/객체를 닫아 복구 시도한다.
+const repairTruncatedJson = (s: string): string | null => {
+  let inStr = false, esc = false;
+  const stack: string[] = [];
+  let out = '';
+  for (const ch of s) {
+    out += ch;
+    if (inStr) {
+      if (esc) esc = false;
+      else if (ch === '\\') esc = true;
+      else if (ch === '"') inStr = false;
+      continue;
+    }
+    if (ch === '"') inStr = true;
+    else if (ch === '{' || ch === '[') stack.push(ch);
+    else if (ch === '}' || ch === ']') stack.pop();
+  }
+  if (!stack.length && !inStr) return null; // 잘리지 않았으면 복구 불필요
+  if (inStr) out += '"';
+  // 마지막에 콤마나 콜론만 남아 값이 비면 제거
+  out = out.replace(/[,:]\s*$/,'');
+  while (stack.length) {
+    const open = stack.pop();
+    out += open === '{' ? '}' : ']';
+  }
+  return out;
+};
+
 export const translateError = (err: any): string => {
   const msg: string = err?.message || '';
   if (msg.includes('quota') || msg.includes('429') || msg.includes('RESOURCE_EXHAUSTED')) {
@@ -126,6 +177,70 @@ export const generatePlanStream = async (opts: {
   return normalizeBold(acc);
 };
 
+// ── 구조화 출력(responseSchema): 모델이 깨진 JSON을 내놓지 않도록 강제한다 ──
+const CONTENT_FORM_SCHEMA = {
+  type: Type.OBJECT,
+  properties: {
+    analysis: { type: Type.STRING },
+    fields: {
+      type: Type.ARRAY,
+      items: {
+        type: Type.OBJECT,
+        properties: {
+          title: { type: Type.STRING },
+          guide: { type: Type.STRING },
+          example: { type: Type.STRING },
+        },
+        required: ['title', 'guide', 'example'],
+      },
+    },
+  },
+  required: ['analysis', 'fields'],
+};
+
+const INTERVIEW_SCHEMA = {
+  type: Type.OBJECT,
+  properties: {
+    questions: {
+      type: Type.ARRAY,
+      items: {
+        type: Type.OBJECT,
+        properties: {
+          question: { type: Type.STRING },
+          hint: { type: Type.STRING },
+          example: { type: Type.STRING },
+        },
+        required: ['question'],
+      },
+    },
+  },
+  required: ['questions'],
+};
+
+const EVALUATION_SCHEMA = {
+  type: Type.OBJECT,
+  properties: {
+    totalScore: { type: Type.NUMBER },
+    summary: { type: Type.STRING },
+    items: {
+      type: Type.ARRAY,
+      items: {
+        type: Type.OBJECT,
+        properties: {
+          name: { type: Type.STRING },
+          score: { type: Type.NUMBER },
+          maxScore: { type: Type.NUMBER },
+          evaluation: { type: Type.STRING },
+          improvement: { type: Type.STRING },
+        },
+        required: ['name', 'score', 'maxScore', 'evaluation', 'improvement'],
+      },
+    },
+    weakestSections: { type: Type.ARRAY, items: { type: Type.STRING } },
+  },
+  required: ['totalScore', 'summary', 'items', 'weakestSections'],
+};
+
 // 업로드 자료(양식/공고/정보/기준)를 분석하여, '전반적인 내용'을 어떻게 써야 할지
 // 안내하는 맞춤 작성 양식(분석 요약 + 항목별 가이드)을 생성한다.
 export const analyzeContentForm = async (opts: {
@@ -157,19 +272,10 @@ export const analyzeContentForm = async (opts: {
   const response = await ai.models.generateContent({
     model,
     contents: { parts },
-    config: { responseMimeType: 'application/json' },
+    config: { responseMimeType: 'application/json', responseSchema: CONTENT_FORM_SCHEMA },
   });
 
-  const raw = stripCodeFence((response as any).text || '');
-  let parsed: ContentFormResult;
-  try {
-    parsed = JSON.parse(raw);
-  } catch {
-    const start = raw.indexOf('{');
-    const end = raw.lastIndexOf('}');
-    if (start === -1 || end === -1) throw new Error('분석 결과를 해석하지 못했습니다. 다시 시도해주세요.');
-    parsed = JSON.parse(raw.slice(start, end + 1));
-  }
+  const parsed = parseJsonLoose<ContentFormResult>((response as any).text || '');
   const fields = Array.isArray(parsed.fields) ? parsed.fields : [];
   return {
     analysis: parsed.analysis?.trim() || '',
@@ -209,19 +315,10 @@ export const generateInterviewQuestions = async (opts: {
   const response = await ai.models.generateContent({
     model,
     contents: { parts },
-    config: { responseMimeType: 'application/json' },
+    config: { responseMimeType: 'application/json', responseSchema: INTERVIEW_SCHEMA },
   });
 
-  const raw = stripCodeFence((response as any).text || '');
-  let parsed: { questions?: InterviewQuestion[] };
-  try {
-    parsed = JSON.parse(raw);
-  } catch {
-    const start = raw.indexOf('{');
-    const end = raw.lastIndexOf('}');
-    if (start === -1 || end === -1) throw new Error('질문을 생성하지 못했습니다. 다시 시도해주세요.');
-    parsed = JSON.parse(raw.slice(start, end + 1));
-  }
+  const parsed = parseJsonLoose<{ questions?: InterviewQuestion[] }>((response as any).text || '');
   const questions = Array.isArray(parsed.questions) ? parsed.questions : [];
   return questions
     .filter(q => q && typeof q.question === 'string' && q.question.trim())
@@ -263,20 +360,10 @@ export const evaluateDraft = async (opts: {
   const response = await ai.models.generateContent({
     model,
     contents: { parts },
-    config: { responseMimeType: 'application/json' },
+    config: { responseMimeType: 'application/json', responseSchema: EVALUATION_SCHEMA },
   });
 
-  const raw = stripCodeFence((response as any).text || '');
-  let parsed: Evaluation;
-  try {
-    parsed = JSON.parse(raw);
-  } catch {
-    // 혹시 앞뒤에 텍스트가 섞이면 첫 { 부터 마지막 } 까지만 잘라 재시도
-    const start = raw.indexOf('{');
-    const end = raw.lastIndexOf('}');
-    if (start === -1 || end === -1) throw new Error('평가 결과를 해석하지 못했습니다. 다시 시도해주세요.');
-    parsed = JSON.parse(raw.slice(start, end + 1));
-  }
+  const parsed = parseJsonLoose<Evaluation>((response as any).text || '');
   return {
     totalScore: Number(parsed.totalScore) || 0,
     summary: parsed.summary || '',
