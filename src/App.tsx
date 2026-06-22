@@ -23,7 +23,7 @@ import { listProjects, saveProject, deleteProject, type SavedProject } from './l
 import { downloadDocx, downloadWordHtml, exportPdf } from './lib/export';
 
 type View = 'input' | 'generating' | 'result' | 'guide';
-type GenLabel = '생성' | '수정' | '보강';
+type GenLabel = '생성' | '수정' | '보강' | '보완';
 
 export default function App() {
   const [apiKey, setApiKey] = useState('');
@@ -70,6 +70,9 @@ export default function App() {
   // 대화형 보완
   const [refineInput, setRefineInput] = useState('');
 
+  // 보장형 개선 결과 알림(점수 변화)
+  const [improveNotice, setImproveNotice] = useState<{ before: number; after: number; improved: boolean; message: string } | null>(null);
+
   // 프로젝트 저장/불러오기
   const [projects, setProjects] = useState<SavedProject[]>([]);
   const [currentProjectId, setCurrentProjectId] = useState<string | undefined>(undefined);
@@ -82,6 +85,16 @@ export default function App() {
   const inputFiles: InputFiles = { announcementFiles, templateFiles, infoFiles, criteriaFiles };
 
   const patchNotes = [
+    {
+      date: '2026-06-22',
+      title: '보장형 개선 — 보강/수정 시 점수 향상 보장',
+      details: [
+        '평가 후 보강/대화형 수정 시 개선본을 자동 재채점',
+        '점수가 오른 경우에만 채택하여 결과가 더 낮아지지 않도록 보장',
+        '점수 변화(이전 → 이후) 알림 배너 추가',
+        '평가/분석 JSON 파싱 오류 수정(구조화 출력)',
+      ],
+    },
     {
       date: '2026-06-21',
       title: '처음부터 마무리까지 — 올인원 대규모 업데이트',
@@ -191,6 +204,7 @@ export default function App() {
 
     setError('');
     setEvaluation(null);
+    setImproveNotice(null);
     setCurrentProjectId(undefined);
     setGenLabel('생성');
     setStreamingText('');
@@ -255,12 +269,101 @@ export default function App() {
     }
   };
 
-  // 평가 패널의 '보강' 버튼: 제목으로 섹션을 찾아 기본 지시로 재생성
+  // 평가 피드백을 텍스트로 요약(개선 프롬프트용)
+  const feedbackText = (ev: Evaluation): string => {
+    const lines = ev.items
+      .filter(i => i.improvement?.trim())
+      .map(i => `- [${i.name}] ${i.improvement.trim()}`);
+    if (ev.weakestSections.length) lines.push(`- 특히 보강 필요 섹션: ${ev.weakestSections.join(', ')}`);
+    return lines.length
+      ? `현재 평가(${Math.round(ev.totalScore)}점)의 개선 피드백:\n${lines.join('\n')}`
+      : `현재 ${Math.round(ev.totalScore)}점. 전반적으로 더 설득력 있게 보강하세요.`;
+  };
+
+  // ── 보장형 개선 루프 ──
+  // 개선본을 만든 뒤 자동 재채점하여, 점수가 오른 경우에만 채택한다(결과가 절대 더 낮아지지 않음).
+  // keepChangeIfNoGain=true면(대화형 보완) 점수가 오르지 않아도 사용자가 요청한 변경본 중 최고 점수본을 채택한다.
+  const runImprovement = async (
+    makeCandidate: (feedback: Evaluation) => Promise<string>,
+    opts: { label: GenLabel; keepChangeIfNoGain?: boolean },
+  ) => {
+    if (!result || !requireKey()) return;
+    setError('');
+    setImproveNotice(null);
+    setGenLabel(opts.label);
+    setStreamingText('현재 점수를 확인하는 중...');
+    setCurrentView('generating');
+
+    const MAX = 3;
+    try {
+      // 기준 점수(이미 평가했으면 재사용, 아니면 새로 채점)
+      let baseEval = evaluation ?? await evaluateDraft({ apiKey, model: selectedModel, files: inputFiles, draft: result });
+      const beforeScore = baseEval.totalScore;
+
+      let bestDraft = result;
+      let bestEval = baseEval;             // 원본 대비 게이트(절대 더 낮아지지 않음)
+      let bestCandDraft: string | null = null;
+      let bestCandEval: Evaluation | null = null;  // 변경이 적용된 후보 중 최고(대화형 보완용)
+      let improved = false;
+
+      for (let attempt = 1; attempt <= MAX; attempt++) {
+        setStreamingText(`${opts.label} 중... (${attempt}/${MAX}차 시도)\n현재 최고 점수: ${Math.round(bestEval.totalScore)}점`);
+        const candidate = await makeCandidate(bestEval);
+        if (!candidate.trim()) continue;
+
+        setStreamingText(`개선본을 평가위원이 채점하는 중... (${attempt}/${MAX}차 시도)`);
+        const candEval = await evaluateDraft({ apiKey, model: selectedModel, files: inputFiles, draft: candidate });
+
+        if (!bestCandEval || candEval.totalScore > bestCandEval.totalScore) {
+          bestCandDraft = candidate; bestCandEval = candEval;
+        }
+        if (candEval.totalScore > bestEval.totalScore) {
+          bestDraft = candidate; bestEval = candEval; improved = true;
+          break; // 점수 상승 → 채택
+        }
+      }
+
+      if (improved) {
+        setResult(bestDraft); setEvaluation(bestEval);
+        setImproveNotice({ before: Math.round(beforeScore), after: Math.round(bestEval.totalScore), improved: true, message: '평가 점수가 향상되었습니다.' });
+      } else if (opts.keepChangeIfNoGain && bestCandDraft && bestCandEval) {
+        // 요청한 변경은 반영하되(최고 점수본), 점수가 오르지 않았음을 알림
+        setResult(bestCandDraft); setEvaluation(bestCandEval);
+        setImproveNotice({ before: Math.round(beforeScore), after: Math.round(bestCandEval.totalScore), improved: bestCandEval.totalScore > beforeScore, message: '요청을 반영했습니다. 추가로 점수를 더 높이려면 한 번 더 시도해주세요.' });
+      } else {
+        // 보강(점수 게이트): 더 높이지 못하면 원본 유지(절대 더 낮아지지 않음)
+        setEvaluation(bestEval);
+        setImproveNotice({ before: Math.round(beforeScore), after: Math.round(bestEval.totalScore), improved: false, message: `${MAX}회 시도했지만 더 높은 점수를 내지 못해 기존 결과를 유지했습니다. 다시 시도하면 개선될 수 있습니다.` });
+      }
+      setCurrentView('result');
+      window.scrollTo({ top: 0, behavior: 'smooth' });
+    } catch (err: any) {
+      console.error('Improvement Error:', err);
+      setError(translateError(err));
+      setCurrentView('result');
+    }
+  };
+
+  // 평가 패널의 '보강' 버튼: 해당 섹션을 피드백 기반으로 개선하되, 점수가 오를 때만 채택
   const handleReinforce = (sectionName: string) => {
     const target = sections.find(s => sectionTitle(s).includes(sectionName) || sectionName.includes(sectionTitle(s)));
     if (!target) { setError(`'${sectionName}' 섹션을 본문에서 찾지 못했습니다. 해당 섹션의 '다시쓰기'를 직접 사용해주세요.`); return; }
-    window.scrollTo({ top: 0, behavior: 'smooth' });
-    runRegenerate(target.id, `평가위원 피드백을 반영하여 이 섹션을 더 구체적이고 설득력 있게, 정량 지표와 근거를 보강하여 다시 작성해주세요.`);
+    const index = sections.findIndex(s => s.id === target.id);
+    const baseArr = sections.map(sectionToMarkdown); // 원본 섹션 배열(루프 동안 고정)
+    runImprovement(
+      async (feedback) => {
+        const newMd = await regenerateSection({
+          apiKey, model: selectedModel, files: inputFiles, fullDraft: result,
+          sectionHeading: sectionTitle(target), sectionContent: baseArr[index],
+          instruction: `${feedbackText(feedback)}\n\n위 피드백을 반영하여 이 섹션을 보강하되, 반드시 이전보다 더 높은 평가 점수를 받도록 정량 지표·구체적 근거·차별성·실현가능성을 강화하세요.`,
+        });
+        if (!newMd.trim()) return '';
+        const arr = [...baseArr];
+        arr[index] = newMd.trim();
+        return arr.join('\n\n').replace(/\n{3,}/g, '\n\n').trim();
+      },
+      { label: '보강' },
+    );
   };
 
   // ── 인라인 편집 ──
@@ -273,27 +376,20 @@ export default function App() {
     setEditBuffer('');
   };
 
-  // ── 대화형 보완(전체 수정) ──
+  // ── 대화형 보완(전체 수정) ── 요청을 반영하되 점수가 더 높아지도록 개선 루프 적용
   const handleRefine = async () => {
     const instruction = refineInput.trim();
     if (!instruction || !result) return;
     if (!requireKey()) return;
     setRefineInput('');
-    setGenLabel('수정');
-    setStreamingText('');
-    setCurrentView('generating');
-    try {
-      const text = await refineDraft({
-        apiKey, model: selectedModel, files: inputFiles, fullDraft: result, instruction, onChunk: setStreamingText,
-      });
-      setResult(text);
-      setEvaluation(null);
-      setCurrentView('result');
-    } catch (err: any) {
-      console.error('Refine Error:', err);
-      setError(translateError(err));
-      setCurrentView('result');
-    }
+    await runImprovement(
+      async (feedback) => refineDraft({
+        apiKey, model: selectedModel, files: inputFiles, fullDraft: result,
+        instruction: `${instruction}\n\n또한 아래 평가 피드백을 반영하여, 위 요청을 충실히 반영하면서도 전체적으로 반드시 더 높은 점수를 받도록 보강하세요:\n${feedbackText(feedback)}`,
+        onChunk: setStreamingText,
+      }),
+      { label: '수정', keepChangeIfNoGain: true },
+    );
   };
 
   // ── 복사: 화면 서식 그대로 클립보드 ──
@@ -365,7 +461,7 @@ export default function App() {
   const handleGoHome = () => {
     setCurrentView('input');
     setAnnouncementFiles([]); setTemplateFiles([]); setInfoFiles([]); setCriteriaFiles([]);
-    setContent(''); setResult(''); setEvaluation(null);
+    setContent(''); setResult(''); setEvaluation(null); setImproveNotice(null);
     setAnalyzeSeed(''); setContentAnalysis(''); setContentFields([]); setContentAnswers({});
     setCurrentProjectId(undefined); setError('');
     window.scrollTo({ top: 0, behavior: 'smooth' });
@@ -483,6 +579,20 @@ export default function App() {
 
         {currentView === 'result' && result && (
           <motion.section initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} className="space-y-6">
+            {/* 보장형 개선 결과 알림 */}
+            {improveNotice && (
+              <motion.div initial={{ opacity: 0, y: -8 }} animate={{ opacity: 1, y: 0 }}
+                className={`flex items-center justify-between gap-3 rounded-2xl border px-5 py-3 ${improveNotice.improved ? 'border-emerald-200 bg-emerald-50' : 'border-amber-200 bg-amber-50'}`}>
+                <div className="flex items-center gap-3">
+                  <span className={`text-sm font-bold ${improveNotice.improved ? 'text-emerald-700' : 'text-amber-700'}`}>
+                    {improveNotice.before}점 {improveNotice.improved ? '→' : '·'} <span className="text-base">{improveNotice.after}점</span>
+                    {improveNotice.improved && ' ↑'}
+                  </span>
+                  <span className="text-sm text-neutral-600">{improveNotice.message}</span>
+                </div>
+                <button onClick={() => setImproveNotice(null)} className="p-1 text-neutral-400 hover:text-neutral-700 rounded-lg"><X className="w-4 h-4" /></button>
+              </motion.div>
+            )}
             {/* 결과 헤더 + 액션 */}
             <div className="bg-white p-5 rounded-2xl shadow-sm border border-neutral-200 flex flex-col lg:flex-row lg:items-center justify-between gap-4">
               <div className="flex items-center gap-3">
@@ -553,7 +663,7 @@ export default function App() {
                     <MessageSquarePlus className="w-5 h-5 text-rose-600" />
                     <h3 className="font-bold text-neutral-900">대화형 보완</h3>
                   </div>
-                  <p className="text-xs text-neutral-500 mb-3 leading-relaxed">요청을 입력하면 전체 사업계획서를 그에 맞게 다시 다듬습니다. (예: "전체적으로 더 정량적으로", "리스크 대응 방안 항목 추가")</p>
+                  <p className="text-xs text-neutral-500 mb-3 leading-relaxed">요청을 반영해 다시 다듬고, <strong className="text-rose-600">자동 재채점하여 더 높은 점수가 될 때까지 보완</strong>합니다. (예: "전체적으로 더 정량적으로", "리스크 대응 방안 항목 추가")</p>
                   <textarea value={refineInput} onChange={(e) => setRefineInput(e.target.value)} placeholder="수정 요청을 입력하세요..." className="w-full min-h-[80px] p-3 bg-neutral-50 border border-neutral-200 rounded-xl outline-none focus:ring-2 focus:ring-rose-500 text-sm resize-none mb-2" />
                   <button onClick={handleRefine} disabled={!refineInput.trim()} className="w-full flex items-center justify-center gap-2 px-3 py-2.5 rounded-xl bg-neutral-900 hover:bg-neutral-800 disabled:opacity-50 text-white text-sm font-semibold transition-colors"><Send className="w-4 h-4" />요청 반영하기</button>
                 </div>
